@@ -1,0 +1,12 @@
+[package]
+name = "ghost-terminal"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Terminal-first Linux client for Project GHOST"
+
+[dependencies]
+ghost-core.workspace = true
+ratatui.workspace = true
+crossterm.workspace = true

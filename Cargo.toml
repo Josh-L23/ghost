@@ -1,0 +1,15 @@
+[workspace]
+members = ["crates/ghost-core", "crates/ghost-terminal"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+ghost-core = { path = "crates/ghost-core" }
+ratatui = "0.30.2"
+crossterm = "0.29"
+
