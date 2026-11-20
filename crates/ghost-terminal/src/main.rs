@@ -13,6 +13,7 @@ use crossterm::{
 };
 use ghost_core::{
     command::{self, Command},
+    dedup::ReplayCache,
     delivery::{self, DeliveryState, PendingQueue, TrackedMessage},
     identity::{self, Identity, IdentityError, IdentityStore},
     messaging::{self, PrivateMessage},
@@ -49,6 +50,7 @@ struct App {
     sessions: HashMap<SocketAddr, EstablishedSession>,
     conversations: HashMap<String, Vec<TrackedMessage>>,
     deliveries: PendingQueue,
+    dedup: ReplayCache,
 }
 
 impl App {
@@ -71,6 +73,7 @@ impl App {
             sessions: HashMap::new(),
             conversations: HashMap::new(),
             deliveries: PendingQueue::new(),
+            dedup: ReplayCache::new(),
         };
         app.lines.push(format!(
             "Welcome, {username}. Your local identity is ready."
@@ -372,6 +375,23 @@ impl App {
                 ));
                 return;
             }
+        };
+        let decrypted = match decrypted {
+            Ok(frame) => match self.dedup.accept(
+                frame.message_id,
+                frame.sender,
+                frame.message_type,
+                frame.created_at,
+                now(),
+            ) {
+                Ok(()) => Ok(frame),
+                Err(error) => {
+                    self.lines
+                        .push(format!("[SESSION] Ignored replayed frame: {error}"));
+                    return;
+                }
+            },
+            Err(error) => Err(error),
         };
         match decrypted {
             Ok(decrypted) if decrypted.message_type == MessageType::CONTROL => {
