@@ -15,8 +15,8 @@ What if you could talk to you'r computer science geeks through the terminal ? Sa
 - The terminal shows a header, an activity timeline, a command line, and a status line.
 - Manual bounded TCP connections use Tokio in `ghost-network`; connections are authenticated with signed hellos and ephemeral X25519 session keys.
 - `/ping` exchanges an encrypted session probe; unverified and blocked peers are refused before a session is established.
-- Recognized commands whose services do not exist yet report that they are not implemented.
-- End-to-end messaging, receipts, and message-history persistence are planned work, not features.
+- `/msg <peer> <text>` sends content encrypted with a per-message key derived from the authenticated session; ciphertext is rejected before plaintext is rendered.
+- `/open <peer>` shows the in-memory conversation. Delivery receipts, persistence, groups, and relay services are still planned work.
 
 ## Run
 
@@ -32,8 +32,8 @@ Inside the terminal, use `/help` for the built-in command list. `/quit`, Escape,
 
 | COMMAND | STATUS |
 | --- | --- |
-| `/help`, `/whoami`, `/peers`, `/verify <peer> <fingerprint>`, `/block <peer>`, `/unblock <peer>`, `/listen <ip:port>`, `/connect <ip:port>`, `/disconnect <ip:port>`, `/ping <ip:port>`, `/clear`, `/quit` | Working in the terminal shell |
-| `/scan`, `/msg <peer> <text>`, `/open <peer>`, `/history [peer\|group]`, `/relay status\|enable\|disable` | Parsed, but the backing service is not implemented |
+| `/help`, `/whoami`, `/peers`, `/verify <peer> <fingerprint>`, `/block <peer>`, `/unblock <peer>`, `/listen <ip:port>`, `/connect <ip:port>`, `/disconnect <ip:port>`, `/ping <ip:port>`, `/msg <peer> <text>`, `/open <peer>`, `/clear`, `/quit` | Working in the terminal shell |
+| `/scan`, `/history [peer\|group]`, `/relay status\|enable\|disable` | Parsed, but the backing service is not implemented |
 | `/group create\|invite\|send` | Planned; currently reported as not implemented |
 
 Message text must be entered with `/msg <peer> <text>`; bare text is not treated as a message yet.

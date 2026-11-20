@@ -14,6 +14,8 @@ use crossterm::{
 use ghost_core::{
     command::{self, Command},
     identity::{self, Identity, IdentityError, IdentityStore},
+    messaging::{self, PrivateMessage},
+    protocol::{IdentityId, MessageType},
     session::{self, EstablishedSession, PendingSession},
     trust::{self, TrustRecord, TrustStore},
 };
@@ -42,6 +44,7 @@ struct App {
     listen_addr: Option<SocketAddr>,
     handshakes: HashMap<SocketAddr, PendingSession>,
     sessions: HashMap<SocketAddr, EstablishedSession>,
+    conversations: HashMap<String, Vec<PrivateMessage>>,
 }
 
 impl App {
@@ -62,6 +65,7 @@ impl App {
             listen_addr: None,
             handshakes: HashMap::new(),
             sessions: HashMap::new(),
+            conversations: HashMap::new(),
         };
         app.lines.push(format!(
             "Welcome, {username}. Your local identity is ready."
@@ -91,7 +95,7 @@ impl App {
                 "/whoami shows your username and identity fingerprint.".into(),
                 "Peers may be selected by label, short fingerprint, or full fingerprint.".into(),
                 "TCP is manual-only; sessions require verified peer fingerprints.".into(),
-                "Storage, end-to-end messaging, and relay services are not implemented yet.".into(),
+                "Message history is in-memory only; storage and relay services are not implemented yet.".into(),
             ]),
             Ok(Command::WhoAmI) => {
                 self.lines
@@ -198,6 +202,55 @@ impl App {
                     )),
                 }
             }
+            Ok(Command::Message { peer, text }) => {
+                let Some(address) = self.resolve_peer_address(&peer) else {
+                    self.lines.push(format!("No session for peer '{peer}'."));
+                    return;
+                };
+                let recipient = match self.sessions.get(&address) {
+                    Some(session) => session.peer_id(),
+                    None => {
+                        self.lines.push(format!("No session for peer '{peer}'."));
+                        return;
+                    }
+                };
+                let result = self.sessions.get_mut(&address).map(|session| {
+                    messaging::compose(session, &self.identity, recipient, &text, now())
+                });
+                match result {
+                    Some(Ok((message, frame))) => {
+                        let label = self.peer_label(&message.recipient);
+                        self.record_message(message);
+                        self.send_command(TransportCommand::Send {
+                            peer: address,
+                            frame,
+                        });
+                        self.lines.push(format!("[MSG] to {label}: {text}"));
+                    }
+                    Some(Err(error)) => self.lines.push(format!("Message failed: {error}")),
+                    None => self.lines.push(format!("No session for peer '{peer}'.")),
+                }
+            }
+            Ok(Command::Open(peer)) => {
+                let key = self.resolve_conversation_key(&peer);
+                let messages = self.conversations.get(&key).cloned().unwrap_or_default();
+                if messages.is_empty() {
+                    self.lines
+                        .push(format!("No messages yet with '{peer}'."));
+                } else {
+                    self.lines.push(format!("Conversation with '{peer}':"));
+                    for message in messages {
+                        let direction = if message.sender == self.identity.identity_id() {
+                            "out"
+                        } else {
+                            "in"
+                        };
+                        let label = self.peer_label(&message.sender);
+                        self.lines
+                            .push(format!("  [{direction}] {label}: {}", message.text));
+                    }
+                }
+            }
             Ok(Command::Clear) => self.lines.clear(),
             Ok(Command::Quit) => self.should_quit = true,
             Ok(_) => self
@@ -279,21 +332,106 @@ impl App {
             return;
         }
 
-        if let Some(session) = self.sessions.get_mut(&peer) {
-            match session.decrypt(&frame, now()) {
-                Ok(plaintext) => self.lines.push(format!(
-                    "[SESSION] {}: {}",
-                    peer,
-                    String::from_utf8_lossy(&plaintext)
-                )),
-                Err(error) => self
-                    .lines
-                    .push(format!("[SESSION] Rejected frame from {peer}: {error}")),
+        let decrypted = match self.sessions.get_mut(&peer) {
+            Some(session) => session.decrypt(&frame, now()),
+            None => {
+                self.lines.push(format!(
+                    "[SESSION] Unexpected frame from {peer} before authentication."
+                ));
+                return;
             }
+        };
+        match decrypted {
+            Ok(decrypted) if decrypted.message_type == MessageType::CONTROL => {
+                let plaintext = String::from_utf8_lossy(&decrypted.plaintext);
+                self.lines.push(format!("[PING] {peer}: {plaintext}"));
+            }
+            Ok(decrypted) => {
+                let opened = match self.sessions.get(&peer) {
+                    Some(session) => messaging::open_frame(session, decrypted),
+                    None => return,
+                };
+                match opened {
+                    Ok(message) => {
+                        let label = self.peer_label(&message.sender);
+                        self.lines.push(format!("[MSG] {label}: {}", message.text));
+                        self.record_message(message);
+                    }
+                    Err(error) => self.lines.push(format!("[MSG] Rejected frame: {error}")),
+                }
+            }
+            Err(error) => self
+                .lines
+                .push(format!("[SESSION] Rejected frame from {peer}: {error}")),
+        }
+    }
+
+    fn resolve_peer_address(&self, selector: &str) -> Option<SocketAddr> {
+        if let Ok(address) = selector.parse::<SocketAddr>() {
+            return self.sessions.contains_key(&address).then_some(address);
+        }
+        self.sessions.iter().find_map(|(address, session)| {
+            let id = session.peer_id();
+            let full = identity::fingerprint_from_public_key(&id.0).full();
+            let matches = session.peer_label() == selector
+                || session::fingerprint_of(&id) == selector
+                || full == selector
+                || id.to_string() == selector;
+            matches.then_some(*address)
+        })
+    }
+
+    fn resolve_conversation_key(&self, selector: &str) -> String {
+        if let Some(address) = self.resolve_peer_address(selector) {
+            if let Some(session) = self.sessions.get(&address) {
+                return session.peer_id().to_string();
+            }
+        }
+        if let Some(record) = self.trust.records().iter().find(|record| {
+            let full = identity::fingerprint_from_public_key(&record.identity_id.0).full();
+            record.label() == selector
+                || record.short_fingerprint() == selector
+                || full == selector
+                || record.identity_id.to_string() == selector
+        }) {
+            return record.identity_id.to_string();
+        }
+        selector.to_owned()
+    }
+
+    fn peer_label(&self, id: &IdentityId) -> String {
+        for session in self.sessions.values() {
+            if session.peer_id() == *id {
+                return session.peer_label().to_owned();
+            }
+        }
+        for record in self.trust.records() {
+            if record.identity_id == *id {
+                return record.label().to_owned();
+            }
+        }
+        session::fingerprint_of(id)
+    }
+
+    fn record_message(&mut self, message: PrivateMessage) {
+        let counterparty = if message.sender == self.identity.identity_id() {
+            message.recipient
         } else {
-            self.lines.push(format!(
-                "[SESSION] Unexpected frame from {peer} before authentication."
-            ));
+            message.sender
+        };
+        let history = self
+            .conversations
+            .entry(counterparty.to_string())
+            .or_default();
+        if history
+            .iter()
+            .any(|item| item.message_id == message.message_id)
+        {
+            return;
+        }
+        history.push(message);
+        if history.len() > 200 {
+            history.remove(0);
         }
     }
 
