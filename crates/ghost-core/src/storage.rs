@@ -14,12 +14,13 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use crate::{
     dedup,
     delivery::DeliveryState,
+    history::{self, EncryptedHistoryRecord},
     identity,
     protocol::{IdentityId, MessageId, MessageType},
     trust::{TrustRecord, TrustState},
 };
 
-const SCHEMA_VERSION: i32 = 1;
+const SCHEMA_VERSION: i32 = 2;
 const MAX_PENDING: usize = 32;
 const MAX_DEDUP: usize = dedup::MAX_DEDUP_ENTRIES;
 
@@ -129,7 +130,7 @@ impl Storage {
     fn initialize(&mut self) -> Result<(), StorageError> {
         self.conn.pragma_update(None, "journal_mode", "WAL")?;
         self.conn.pragma_update(None, "foreign_keys", "ON")?;
-        let version: i32 = self
+        let mut version: i32 = self
             .conn
             .pragma_query_value(None, "user_version", |row| row.get(0))?;
         if version > SCHEMA_VERSION {
@@ -139,6 +140,10 @@ impl Storage {
         }
         if version == 0 {
             self.migrate_to_v1()?;
+            version = 1;
+        }
+        if version == 1 {
+            self.migrate_to_v2()?;
         }
         Ok(())
     }
@@ -186,6 +191,31 @@ impl Storage {
             );
             CREATE INDEX IF NOT EXISTS idx_dedup_seen_at ON dedup_metadata(seen_at);
             CREATE INDEX IF NOT EXISTS idx_delivery_expires ON delivery_state(expires_at);
+            ",
+        )?;
+        tx.pragma_update(None, "user_version", 1)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn migrate_to_v2(&mut self) -> Result<(), StorageError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS message_history (
+                message_id BLOB PRIMARY KEY CHECK (length(message_id) = 16),
+                conversation_id TEXT NOT NULL,
+                sender BLOB NOT NULL CHECK (length(sender) = 32),
+                recipient BLOB NOT NULL CHECK (length(recipient) = 32),
+                created_at INTEGER NOT NULL,
+                outgoing INTEGER NOT NULL CHECK (outgoing IN (0, 1)),
+                nonce BLOB NOT NULL CHECK (length(nonce) = 12),
+                ciphertext BLOB NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_history_conversation
+                ON message_history(conversation_id, created_at);
             ",
         )?;
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -514,6 +544,115 @@ fn bytes_to_id16(bytes: &[u8]) -> Result<[u8; 16], StorageError> {
         .map_err(|_| StorageError::Corrupt("expected 16 bytes".into()))
 }
 
+impl Storage {
+    pub fn store_history(&mut self, record: &EncryptedHistoryRecord) -> Result<(), StorageError> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO message_history
+                (message_id, conversation_id, sender, recipient, created_at, outgoing, nonce, ciphertext)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                record.message_id.0.as_slice(),
+                record.conversation_id,
+                record.sender.0.as_slice(),
+                record.recipient.0.as_slice(),
+                record.created_at as i64,
+                if record.outgoing { 1i64 } else { 0i64 },
+                record.nonce.as_slice(),
+                record.ciphertext.as_slice(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn load_history(
+        &self,
+        conversation_id: Option<&str>,
+    ) -> Result<Vec<EncryptedHistoryRecord>, StorageError> {
+        let mut out = Vec::new();
+        if let Some(conversation_id) = conversation_id {
+            let mut stmt = self.conn.prepare(
+                "SELECT message_id, conversation_id, sender, recipient, created_at, outgoing, nonce, ciphertext
+                 FROM message_history WHERE conversation_id = ?1 ORDER BY created_at ASC",
+            )?;
+            let rows = stmt.query_map(params![conversation_id], Self::map_history_row)?;
+            for row in rows {
+                out.push(row?);
+            }
+        } else {
+            let mut stmt = self.conn.prepare(
+                "SELECT message_id, conversation_id, sender, recipient, created_at, outgoing, nonce, ciphertext
+                 FROM message_history ORDER BY created_at ASC",
+            )?;
+            let rows = stmt.query_map([], Self::map_history_row)?;
+            for row in rows {
+                out.push(row?);
+            }
+        }
+        Ok(out)
+    }
+
+    fn map_history_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EncryptedHistoryRecord> {
+        let message_id: Vec<u8> = row.get(0)?;
+        let conversation_id: String = row.get(1)?;
+        let sender: Vec<u8> = row.get(2)?;
+        let recipient: Vec<u8> = row.get(3)?;
+        let created_at: i64 = row.get(4)?;
+        let outgoing: i64 = row.get(5)?;
+        let nonce: Vec<u8> = row.get(6)?;
+        let ciphertext: Vec<u8> = row.get(7)?;
+        Ok(EncryptedHistoryRecord {
+            message_id: MessageId(bytes_to_id16_sql(&message_id)?),
+            conversation_id,
+            sender: IdentityId(bytes_to_id32_sql(&sender)?),
+            recipient: IdentityId(bytes_to_id32_sql(&recipient)?),
+            created_at: created_at as u64,
+            outgoing: outgoing != 0,
+            nonce: nonce.as_slice().try_into().map_err(|_| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    6,
+                    rusqlite::types::Type::Blob,
+                    "expected 12 bytes".into(),
+                )
+            })?,
+            ciphertext,
+        })
+    }
+
+    pub fn load_and_decrypt_history(
+        &self,
+        conversation_id: Option<&str>,
+        key: &zeroize::Zeroizing<[u8; 32]>,
+    ) -> Result<Vec<history::HistoryRecord>, StorageError> {
+        self.load_history(conversation_id)?
+            .into_iter()
+            .map(|record| {
+                history::decrypt_record(&record, key)
+                    .map_err(|error| StorageError::Corrupt(error.to_string()))
+            })
+            .collect()
+    }
+}
+
+fn bytes_to_id32_sql(bytes: &[u8]) -> rusqlite::Result<[u8; 32]> {
+    bytes.try_into().map_err(|_| {
+        rusqlite::Error::FromSqlConversionFailure(
+            0,
+            rusqlite::types::Type::Blob,
+            "expected 32 bytes".into(),
+        )
+    })
+}
+
+fn bytes_to_id16_sql(bytes: &[u8]) -> rusqlite::Result<[u8; 16]> {
+    bytes.try_into().map_err(|_| {
+        rusqlite::Error::FromSqlConversionFailure(
+            0,
+            rusqlite::types::Type::Blob,
+            "expected 16 bytes".into(),
+        )
+    })
+}
+
 pub fn default_storage_path() -> Result<PathBuf, StorageError> {
     identity::default_data_dir()
         .map(|dir| dir.join("ghost.db"))
@@ -693,5 +832,80 @@ mod tests {
             !raw.windows(b"secret-body".len())
                 .any(|w| w == b"secret-body")
         );
+    }
+
+    #[test]
+    fn encrypted_history_round_trip_and_no_plaintext_on_disk() {
+        use crate::history::{HistoryRecord, decrypt_record, encrypt_record};
+        use zeroize::Zeroizing;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("ghost.db");
+        let key = Zeroizing::new([9u8; 32]);
+        let plaintext = "top secret history body";
+        let record = HistoryRecord {
+            message_id: MessageId([11; 16]),
+            conversation_id: "peer-conv".into(),
+            sender: IdentityId([1; 32]),
+            recipient: IdentityId([2; 32]),
+            created_at: 42,
+            outgoing: true,
+            body: plaintext.into(),
+        };
+        {
+            let mut storage = Storage::open(&path).unwrap();
+            let encrypted = encrypt_record(&record, &key).unwrap();
+            storage.store_history(&encrypted).unwrap();
+        }
+        let raw = fs::read(&path).unwrap();
+        assert!(
+            !raw.windows(plaintext.len())
+                .any(|w| w == plaintext.as_bytes())
+        );
+        let storage = Storage::open(&path).unwrap();
+        let stored = storage.load_history(Some("peer-conv")).unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(decrypt_record(&stored[0], &key).unwrap(), record);
+        let decrypted = storage
+            .load_and_decrypt_history(Some("peer-conv"), &key)
+            .unwrap();
+        assert_eq!(decrypted, vec![record]);
+    }
+
+    #[test]
+    fn tampered_history_is_detected_on_read() {
+        use crate::history::{HistoryRecord, encrypt_record};
+        use zeroize::Zeroizing;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("ghost.db");
+        let key = Zeroizing::new([4u8; 32]);
+        let record = HistoryRecord {
+            message_id: MessageId([12; 16]),
+            conversation_id: "peer-x".into(),
+            sender: IdentityId([1; 32]),
+            recipient: IdentityId([2; 32]),
+            created_at: 99,
+            outgoing: false,
+            body: "sensitive".into(),
+        };
+        {
+            let mut storage = Storage::open(&path).unwrap();
+            let encrypted = encrypt_record(&record, &key).unwrap();
+            storage.store_history(&encrypted).unwrap();
+            storage
+                .conn
+                .execute(
+                    "UPDATE message_history SET ciphertext = randomblob(length(ciphertext)) WHERE message_id = ?1",
+                    params![record.message_id.0.as_slice()],
+                )
+                .unwrap();
+        }
+        let storage = Storage::open(&path).unwrap();
+        let err = storage
+            .load_and_decrypt_history(Some("peer-x"), &key)
+            .unwrap_err();
+        assert!(matches!(err, StorageError::Corrupt(_)));
+        assert!(!err.to_string().contains("sensitive"));
     }
 }
