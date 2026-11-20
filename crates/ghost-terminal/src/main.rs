@@ -1,4 +1,8 @@
-use std::{error::Error, io, time::Duration};
+use std::{
+    error::Error,
+    io,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
@@ -8,6 +12,7 @@ use crossterm::{
 use ghost_core::{
     command::{self, Command},
     identity::{self, Identity, IdentityError, IdentityStore},
+    trust::{self, TrustRecord, TrustStore},
 };
 use ratatui::{
     Terminal,
@@ -19,7 +24,6 @@ use ratatui::{
 };
 use zeroize::Zeroizing;
 
-#[derive(Default)]
 struct App {
     input: String,
     lines: Vec<String>,
@@ -27,21 +31,29 @@ struct App {
     identity_label: String,
     fingerprint_short: String,
     fingerprint_full: String,
+    trust: TrustStore,
 }
 
 impl App {
-    fn new(identity: &Identity) -> Self {
+    fn new(identity: &Identity, trust: TrustStore) -> Self {
         let fingerprint = identity.fingerprint();
         let mut app = Self {
+            input: String::new(),
+            lines: Vec::new(),
+            should_quit: false,
             identity_label: identity.username().to_owned(),
             fingerprint_short: fingerprint.short(),
             fingerprint_full: fingerprint.full(),
-            ..Self::default()
+            trust,
         };
         app.lines.push(format!(
             "Welcome, {}. Your local identity is ready.",
             identity.username()
         ));
+        app.lines.push(
+            "Unverified peers are never trusted automatically; compare fingerprints out-of-band."
+                .into(),
+        );
         app.lines
             .push("Type /help for available commands. Use /quit or Ctrl-C to exit.".into());
         app
@@ -55,11 +67,13 @@ impl App {
         self.lines.push(format!("› {input}"));
         match command::parse(&input) {
             Ok(Command::Help) => self.lines.extend([
-                "Commands: /help /whoami /peers /scan /connect <ip:port>".into(),
+                "Commands: /help /whoami /peers /verify <peer> <fingerprint>".into(),
+                "          /block <peer> /unblock <peer> /scan /connect <ip:port>".into(),
                 "          /disconnect <peer> /msg <peer> <text> /open <peer>".into(),
                 "          /history [peer|group] /relay status|enable|disable".into(),
                 "          /clear /quit".into(),
                 "/whoami shows your username and identity fingerprint.".into(),
+                "Peers may be selected by label, short fingerprint, or full fingerprint.".into(),
                 "Network, storage, and relay services are not implemented yet.".into(),
             ]),
             Ok(Command::WhoAmI) => {
@@ -72,6 +86,44 @@ impl App {
                 self.lines
                     .push("Compare the fingerprint out-of-band before trusting a peer.".into());
             }
+            Ok(Command::Peers) => {
+                if self.trust.records().is_empty() {
+                    self.lines
+                        .push("No known peers. Connect to a peer to learn its identity.".into());
+                } else {
+                    self.lines
+                        .push("Known peers (status is text, not colour-dependent):".into());
+                    for record in self.trust.records() {
+                        self.lines.push(describe_record(record));
+                    }
+                }
+            }
+            Ok(Command::Verify { peer, fingerprint }) => {
+                match self.trust.verify(&peer, &fingerprint, now()) {
+                    Ok(record) => self.lines.push(format!(
+                        "[VERIFIED] {} ({}) is trusted for direct sessions.",
+                        record.label(),
+                        record.short_fingerprint()
+                    )),
+                    Err(error) => self.lines.push(format!("Verification failed: {error}")),
+                }
+            }
+            Ok(Command::Block(peer)) => match self.trust.block(&peer, now()) {
+                Ok(record) => self.lines.push(format!(
+                    "[BLOCKED] {} ({}) will not be trusted.",
+                    record.label(),
+                    record.short_fingerprint()
+                )),
+                Err(error) => self.lines.push(format!("Block failed: {error}")),
+            },
+            Ok(Command::Unblock(peer)) => match self.trust.unblock(&peer, now()) {
+                Ok(record) => self.lines.push(format!(
+                    "[UNVERIFIED] {} ({}) can now be verified.",
+                    record.label(),
+                    record.short_fingerprint()
+                )),
+                Err(error) => self.lines.push(format!("Unblock failed: {error}")),
+            },
             Ok(Command::Clear) => self.lines.clear(),
             Ok(Command::Quit) => self.should_quit = true,
             Ok(_) => self
@@ -80,6 +132,29 @@ impl App {
             Err(error) => self.lines.push(format!("Error: {error}")),
         }
     }
+}
+
+fn describe_record(record: &TrustRecord) -> String {
+    let note = match record.state {
+        trust::TrustState::Unverified => " claimed name; verify before trusting",
+        trust::TrustState::Verified => " verified out-of-band",
+        trust::TrustState::Blocked => " revoked; will not be trusted",
+    };
+    format!(
+        "[{}] {} fp={} id={} —{}",
+        record.state.label(),
+        record.label(),
+        record.short_fingerprint(),
+        record.identity_id,
+        note
+    )
+}
+
+fn now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or_default()
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -99,7 +174,8 @@ fn main() -> Result<(), Box<dyn Error>> {
 
 fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<(), Box<dyn Error>> {
     let identity = setup_identity(terminal)?;
-    let mut app = App::new(&identity);
+    let trust = TrustStore::load_or_empty(trust::default_trust_path()?)?;
+    let mut app = App::new(&identity, trust);
 
     while !app.should_quit {
         terminal.draw(|frame| draw(frame, &app))?;
@@ -165,10 +241,19 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
         .block(Block::default().title(" Command ").borders(Borders::ALL));
     frame.render_widget(input, areas[2]);
 
+    let verified = app
+        .trust
+        .records()
+        .iter()
+        .filter(|record| record.state == trust::TrustState::Verified)
+        .count();
     frame.render_widget(
         Paragraph::new(format!(
-            "Identity: {}  |  Peers: none  |  Ctrl-C: quit",
-            app.identity_label
+            "Identity: {} ({})  |  Peers: {} ({} verified)  |  Ctrl-C: quit",
+            app.identity_label,
+            app.fingerprint_short,
+            app.trust.records().len(),
+            verified
         )),
         areas[3],
     );
@@ -319,4 +404,28 @@ fn draw_prompt(
         Paragraph::new("Enter to continue · Ctrl-C or Esc to cancel"),
         areas[3],
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ghost_core::{
+        protocol::{BoundedBytes, IdentityId},
+        trust::TrustState,
+    };
+
+    #[test]
+    fn trust_descriptions_are_textual() {
+        let record = TrustRecord {
+            identity_id: IdentityId([1; 32]),
+            label: BoundedBytes::new(b"ada".to_vec()).unwrap(),
+            state: TrustState::Unverified,
+            created_at: 1,
+            updated_at: 1,
+            last_seen: 1,
+        };
+        let description = describe_record(&record);
+        assert!(description.contains("[UNVERIFIED]"));
+        assert!(description.contains("verify before trusting"));
+    }
 }

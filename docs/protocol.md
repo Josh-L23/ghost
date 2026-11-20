@@ -76,6 +76,16 @@ The nonce is 96 bits of randomness from the OS CSPRNG and must never repeat unde
 
 Transport security and end-to-end encryption are separate: a secure session does not give a relay permission to decrypt content, and a transport write does not prove delivery.
 
+## Trust records
+
+Trust records are local state, never received from a peer as proof. A record stores the peer's Ed25519 identity key, the claimed label, a `UNVERIFIED`, `VERIFIED`, or `BLOCKED` state, and timestamps. Labels are untrusted hints; only the full fingerprint out-of-band comparison can move a record to `VERIFIED`.
+
+- `UNVERIFIED` peers may be observed and shown, but must carry a prominent text warning and cannot be treated as trusted from a network message alone.
+- `VERIFIED` means the user confirmed the full fingerprint of the exact identity key. Verification survives restart in `trust.ghost` with restrictive file permissions.
+- `BLOCKED` peers cannot be verified until explicitly unblocked.
+- If a claimed label reappears with a different identity key, the peer is reported as a key change and a new unverified record is created; the old record's state is not silently changed. Both keys must be resolved explicitly by the user.
+- Relay authorization, group membership, message access, and local storage access are separate capabilities and are not implied by any trust state.
+
 ## Validation rules and limits
 
 | Rule | Value |
