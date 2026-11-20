@@ -227,6 +227,10 @@ pub struct EstablishedSession {
 }
 
 impl EstablishedSession {
+    pub fn local_id(&self) -> IdentityId {
+        self.local_id
+    }
+
     pub fn peer_id(&self) -> IdentityId {
         self.peer_id
     }

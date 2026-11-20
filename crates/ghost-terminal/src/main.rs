@@ -13,6 +13,7 @@ use crossterm::{
 };
 use ghost_core::{
     command::{self, Command},
+    delivery::{self, DeliveryState, PendingQueue, TrackedMessage},
     identity::{self, Identity, IdentityError, IdentityStore},
     messaging::{self, PrivateMessage},
     protocol::{IdentityId, MessageType},
@@ -30,6 +31,8 @@ use ratatui::{
 };
 use zeroize::Zeroizing;
 
+const RECEIPT_TIMEOUT_SECS: u64 = 60;
+
 struct App {
     input: String,
     lines: Vec<String>,
@@ -44,7 +47,8 @@ struct App {
     listen_addr: Option<SocketAddr>,
     handshakes: HashMap<SocketAddr, PendingSession>,
     sessions: HashMap<SocketAddr, EstablishedSession>,
-    conversations: HashMap<String, Vec<PrivateMessage>>,
+    conversations: HashMap<String, Vec<TrackedMessage>>,
+    deliveries: PendingQueue,
 }
 
 impl App {
@@ -66,6 +70,7 @@ impl App {
             handshakes: HashMap::new(),
             sessions: HashMap::new(),
             conversations: HashMap::new(),
+            deliveries: PendingQueue::new(),
         };
         app.lines.push(format!(
             "Welcome, {username}. Your local identity is ready."
@@ -95,6 +100,7 @@ impl App {
                 "/whoami shows your username and identity fingerprint.".into(),
                 "Peers may be selected by label, short fingerprint, or full fingerprint.".into(),
                 "TCP is manual-only; sessions require verified peer fingerprints.".into(),
+                "Delivery indicators are text; a transport write is not a receipt.".into(),
                 "Message history is in-memory only; storage and relay services are not implemented yet.".into(),
             ]),
             Ok(Command::WhoAmI) => {
@@ -219,13 +225,36 @@ impl App {
                 });
                 match result {
                     Some(Ok((message, frame))) => {
+                        let message_id = message.message_id;
                         let label = self.peer_label(&message.recipient);
-                        self.record_message(message);
-                        self.send_command(TransportCommand::Send {
+                        let queued = self
+                            .deliveries
+                            .insert(message.clone(), now() + RECEIPT_TIMEOUT_SECS)
+                            .is_ok();
+                        self.record_message(message, DeliveryState::Queued);
+                        if !queued {
+                            self.set_message_state(&message_id, DeliveryState::Failed);
+                            self.lines.push(format!(
+                                "Message failed: {}",
+                                delivery::DeliveryError::QueueFull
+                            ));
+                            return;
+                        }
+                        let sent = self.send_command(TransportCommand::Send {
                             peer: address,
                             frame,
                         });
-                        self.lines.push(format!("[MSG] to {label}: {text}"));
+                        let state = if sent {
+                            DeliveryState::Sent
+                        } else {
+                            DeliveryState::Failed
+                        };
+                        let _ = self.deliveries.set_state(&message_id, state);
+                        self.set_message_state(&message_id, state);
+                        self.lines.push(format!(
+                            "[MSG] to {label}: {text} [{}]",
+                            state.label()
+                        ));
                     }
                     Some(Err(error)) => self.lines.push(format!("Message failed: {error}")),
                     None => self.lines.push(format!("No session for peer '{peer}'.")),
@@ -239,15 +268,18 @@ impl App {
                         .push(format!("No messages yet with '{peer}'."));
                 } else {
                     self.lines.push(format!("Conversation with '{peer}':"));
-                    for message in messages {
-                        let direction = if message.sender == self.identity.identity_id() {
+                    for tracked in messages {
+                        let direction = if tracked.message.sender == self.identity.identity_id() {
                             "out"
                         } else {
                             "in"
                         };
-                        let label = self.peer_label(&message.sender);
-                        self.lines
-                            .push(format!("  [{direction}] {label}: {}", message.text));
+                        let label = self.peer_label(&tracked.message.sender);
+                        self.lines.push(format!(
+                            "  [{direction}] {label}: {} [{}]",
+                            tracked.message.text,
+                            tracked.state.label()
+                        ));
                     }
                 }
             }
@@ -346,6 +378,31 @@ impl App {
                 let plaintext = String::from_utf8_lossy(&decrypted.plaintext);
                 self.lines.push(format!("[PING] {peer}: {plaintext}"));
             }
+            Ok(decrypted) if decrypted.message_type == MessageType::RECEIPT => {
+                let opened = match self.sessions.get(&peer) {
+                    Some(session) => messaging::open_receipt_frame(session, decrypted),
+                    None => return,
+                };
+                match opened {
+                    Ok(receipt) => match self.deliveries.acknowledge(&receipt.acknowledged) {
+                        Ok(tracked) => {
+                            self.set_message_state(
+                                &receipt.acknowledged,
+                                DeliveryState::Acknowledged,
+                            );
+                            let label = self.peer_label(&tracked.message.recipient);
+                            self.lines.push(format!(
+                                "[STATE] {label} message acknowledged [{}]",
+                                DeliveryState::Acknowledged.label()
+                            ));
+                        }
+                        Err(_) => self.lines.push("[STATE] Ignored unknown receipt.".into()),
+                    },
+                    Err(error) => self
+                        .lines
+                        .push(format!("[STATE] Rejected receipt: {error}")),
+                }
+            }
             Ok(decrypted) => {
                 let opened = match self.sessions.get(&peer) {
                     Some(session) => messaging::open_frame(session, decrypted),
@@ -354,8 +411,21 @@ impl App {
                 match opened {
                     Ok(message) => {
                         let label = self.peer_label(&message.sender);
+                        let message_id = message.message_id;
                         self.lines.push(format!("[MSG] {label}: {}", message.text));
-                        self.record_message(message);
+                        self.record_message(message, DeliveryState::Received);
+                        let receipt = self.sessions.get_mut(&peer).map(|session| {
+                            messaging::compose_receipt(session, &self.identity, message_id, now())
+                        });
+                        match receipt {
+                            Some(Ok((_, frame))) => {
+                                let _ = self.send_command(TransportCommand::Send { peer, frame });
+                            }
+                            Some(Err(error)) => {
+                                self.lines.push(format!("[STATE] Receipt failed: {error}"))
+                            }
+                            None => {}
+                        }
                     }
                     Err(error) => self.lines.push(format!("[MSG] Rejected frame: {error}")),
                 }
@@ -413,7 +483,7 @@ impl App {
         session::fingerprint_of(id)
     }
 
-    fn record_message(&mut self, message: PrivateMessage) {
+    fn record_message(&mut self, message: PrivateMessage, state: DeliveryState) {
         let counterparty = if message.sender == self.identity.identity_id() {
             message.recipient
         } else {
@@ -425,13 +495,44 @@ impl App {
             .or_default();
         if history
             .iter()
-            .any(|item| item.message_id == message.message_id)
+            .any(|item| item.message.message_id == message.message_id)
         {
             return;
         }
-        history.push(message);
+        history.push(TrackedMessage {
+            message,
+            state,
+            expires_at: now() + RECEIPT_TIMEOUT_SECS,
+        });
         if history.len() > 200 {
             history.remove(0);
+        }
+    }
+
+    fn set_message_state(
+        &mut self,
+        message_id: &ghost_core::protocol::MessageId,
+        state: DeliveryState,
+    ) {
+        for history in self.conversations.values_mut() {
+            if let Some(item) = history
+                .iter_mut()
+                .find(|item| item.message.message_id == *message_id)
+            {
+                item.state = state;
+                return;
+            }
+        }
+    }
+
+    fn expire_pending(&mut self, now: u64) {
+        let expired = self.deliveries.expire(now);
+        for message_id in expired {
+            self.set_message_state(&message_id, DeliveryState::Expired);
+            self.lines.push(format!(
+                "[STATE] Message expired [{}]",
+                DeliveryState::Expired.label()
+            ));
         }
     }
 
@@ -447,9 +548,13 @@ impl App {
         }
     }
 
-    fn send_command(&mut self, command: TransportCommand) {
-        if let Err(error) = self.transport.command(command) {
-            self.lines.push(format!("Transport error: {error}"));
+    fn send_command(&mut self, command: TransportCommand) -> bool {
+        match self.transport.command(command) {
+            Ok(()) => true,
+            Err(error) => {
+                self.lines.push(format!("Transport error: {error}"));
+                false
+            }
         }
     }
 }
@@ -504,6 +609,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<(), Box<
 
     while !app.should_quit {
         app.drain_events();
+        app.expire_pending(now());
         terminal.draw(|frame| draw(frame, &app))?;
         if event::poll(Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
