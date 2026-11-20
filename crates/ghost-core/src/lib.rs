@@ -7,3 +7,4 @@ pub mod command;
 pub mod event;
 pub mod identity;
 pub mod protocol;
+pub mod trust;

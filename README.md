@@ -10,7 +10,8 @@ What if you could talk to you'r computer science geeks through the terminal ? Sa
 
 - Rust workspace with a UI-independent `ghost-core` crate and a Ratatui/Crossterm terminal shell.
 - Slash commands are parsed, including quoted arguments and backslash escaping.
-- A versioned wire envelope with bounded validation rules and a passphrase-protected local identity are defined in `ghost-core`.
+- A versioned wire envelope with bounded validation rules, a passphrase-protected local identity, and a persistent peer trust store are defined in `ghost-core`.
+- Trust state is `UNVERIFIED`, `VERIFIED`, or `BLOCKED`; `/verify` requires the full fingerprint and survives restart.
 - The terminal shows a header, an activity timeline, a command line, and a status line.
 - Recognized commands whose services do not exist yet report that they are not implemented.
 - Manual TCP connections, authenticated sessions, encrypted messaging, and message-history persistence are planned work, not features.
@@ -29,8 +30,8 @@ Inside the terminal, use `/help` for the built-in command list. `/quit`, Escape,
 
 | COMMAND | STATUS |
 | --- | --- |
-| `/help`, `/whoami`, `/clear`, `/quit` | Working in the terminal shell |
-| `/peers`, `/scan`, `/connect <ip:port>`, `/disconnect <peer>`, `/msg <peer> <text>`, `/open <peer>`, `/history [peer\|group]`, `/relay status\|enable\|disable` | Parsed, but the backing service is not implemented |
+| `/help`, `/whoami`, `/peers`, `/verify <peer> <fingerprint>`, `/block <peer>`, `/unblock <peer>`, `/clear`, `/quit` | Working in the terminal shell |
+| `/scan`, `/connect <ip:port>`, `/disconnect <peer>`, `/msg <peer> <text>`, `/open <peer>`, `/history [peer\|group]`, `/relay status\|enable\|disable` | Parsed, but the backing service is not implemented |
 | `/group create\|invite\|send` | Planned; currently reported as not implemented |
 
 Message text must be entered with `/msg <peer> <text>`; bare text is not treated as a message yet.

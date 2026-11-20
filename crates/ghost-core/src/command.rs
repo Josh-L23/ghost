@@ -8,6 +8,9 @@ pub enum Command {
     Help,
     WhoAmI,
     Peers,
+    Verify { peer: String, fingerprint: String },
+    Block(String),
+    Unblock(String),
     Scan,
     Connect(SocketAddr),
     Disconnect(String),
@@ -59,6 +62,12 @@ pub fn parse(input: &str) -> Result<Command, CommandError> {
         ("help", []) => Ok(Command::Help),
         ("whoami", []) => Ok(Command::WhoAmI),
         ("peers", []) => Ok(Command::Peers),
+        ("verify", [peer, fingerprint]) => Ok(Command::Verify {
+            peer: peer.clone(),
+            fingerprint: fingerprint.clone(),
+        }),
+        ("block", [peer]) => Ok(Command::Block(peer.clone())),
+        ("unblock", [peer]) => Ok(Command::Unblock(peer.clone())),
         ("scan", []) => Ok(Command::Scan),
         ("connect", [address]) => address
             .parse()
@@ -129,4 +138,26 @@ fn tokenize(input: &str) -> Result<Vec<String>, CommandError> {
         words.push(word);
     }
     Ok(words)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_trust_commands() {
+        assert_eq!(
+            parse("/verify ada 0123456789abcdef").unwrap(),
+            Command::Verify {
+                peer: "ada".into(),
+                fingerprint: "0123456789abcdef".into(),
+            }
+        );
+        assert_eq!(parse("/block ada").unwrap(), Command::Block("ada".into()));
+        assert_eq!(
+            parse("/unblock ada").unwrap(),
+            Command::Unblock("ada".into())
+        );
+        assert!(parse("/verify ada").is_err());
+    }
 }

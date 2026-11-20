@@ -315,8 +315,8 @@ impl IdentityStore {
     }
 }
 
-pub fn default_identity_path() -> Result<PathBuf, IdentityError> {
-    let base = env::var_os("XDG_DATA_HOME")
+pub fn default_data_dir() -> Result<PathBuf, IdentityError> {
+    env::var_os("XDG_DATA_HOME")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
         .or_else(|| {
@@ -329,8 +329,12 @@ pub fn default_identity_path() -> Result<PathBuf, IdentityError> {
                 .filter(|value| !value.is_empty())
                 .map(PathBuf::from)
         })
-        .ok_or(IdentityError::DataDirectoryUnavailable)?;
-    Ok(base.join("ghost").join("identity.ghost"))
+        .map(|base| base.join("ghost"))
+        .ok_or(IdentityError::DataDirectoryUnavailable)
+}
+
+pub fn default_identity_path() -> Result<PathBuf, IdentityError> {
+    Ok(default_data_dir()?.join("identity.ghost"))
 }
 
 pub fn fingerprint_from_public_key(public_key: &[u8; 32]) -> Fingerprint {
