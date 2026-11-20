@@ -5,8 +5,9 @@ This note turns the [technical specification and implementation blueprint](<PROJ
 ## Current crate boundaries
 
 - `ghost-core` holds command concepts and typed application events. It must remain independent of Ratatui, terminal I/O, and concrete transports.
+- `ghost-network` owns Tokio transport adapters behind a bounded command/event interface; the first adapter is manual TCP.
 - `ghost-terminal` owns startup, terminal lifecycle, keyboard input, rendering, and translating user input into core commands.
-- Future transport adapters should implement interfaces owned by the networking/core layer. Messaging must not depend on Wi-Fi or Bluetooth APIs.
+- Messaging must not depend on Wi-Fi, TCP, or Bluetooth APIs; it consumes transport events and sends transport commands.
 
 The initial UI recognizes some future commands to reserve a discoverable command language. Until their application services exist, it reports that they are not implemented.
 

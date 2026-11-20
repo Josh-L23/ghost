@@ -1,6 +1,6 @@
 # GHOST v1 wire protocol and cryptographic design
 
-Status: proposed v1 design reviewed against the technical blueprint. It is not an external security audit and is not a production-security claim. The `ghost-core` crate currently implements the envelope types, framing, and validation rules; cryptographic operations and transports are tracked in separate issues.
+Status: proposed v1 design reviewed against the technical blueprint. It is not an external security audit and is not a production-security claim. `ghost-core` implements the envelope types, framing, validation rules, identity, and trust records; `ghost-network` implements bounded manual TCP transport. Authenticated sessions and message cryptography are tracked in separate issues.
 
 Source: [technical blueprint](<PROJECT GHOST — Technical Specification and Implementation Blueprint.md>) sections 6, 7.4, 8, 9, 12, 13, 16, and 17.
 
@@ -102,6 +102,22 @@ Trust records are local state, never received from a peer as proof. A record sto
 | Encoding | No trailing bytes, known types only, bounded length-prefixed data |
 
 Envelopes failing validation are rejected before they reach messaging, storage, or the UI. Error messages must not include plaintext payloads, keys, or authentication material.
+
+## Transport limits
+
+The first adapter is manual TCP over a bounded command/event interface. The UI never auto-connects; `/listen`, `/connect`, and `/disconnect` are explicit user actions.
+
+| Limit | Value |
+| --- | --- |
+| Concurrent connections | At most 8 |
+| Command queue | 128 commands |
+| Event queue | 128 events |
+| Per-peer write queue | 16 frames |
+| Connect timeout | 5 seconds |
+| Read/write timeout | 10 seconds |
+| Declared frame payload | 1 to 65,532 bytes; larger lengths rejected before payload allocation |
+
+A partial frame, empty frame, oversized declared length, timeout, or abrupt close produces a non-sensitive event and closes only that connection. A transport write is not proof of remote receipt or application processing.
 
 ## Cryptographic choices
 

@@ -8,6 +8,8 @@ description = "Terminal-first Linux client for Project GHOST"
 
 [dependencies]
 ghost-core.workspace = true
+ghost-network.workspace = true
 ratatui.workspace = true
+tokio.workspace = true
 crossterm.workspace = true
 zeroize = "1"

@@ -14,10 +14,14 @@ use std::{
     fs::{self, DirBuilder, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
 };
 use zeroize::Zeroizing;
 
-use crate::protocol::{BoundedBytes, IdentityId, Signature};
+use crate::protocol::{
+    BoundedBytes, Envelope, IdentityId, MessageId, MessageType, ProtocolError, Recipient,
+    RoutingMetadata, Signature, encode_frame,
+};
 
 const MAGIC: &[u8; 8] = b"GHOSTID1";
 const VERSION: u16 = 1;
@@ -167,6 +171,33 @@ impl Identity {
     pub fn sign(&self, message: &[u8]) -> Signature {
         let signature: ed25519_dalek::Signature = self.signing_key.sign(message);
         Signature(signature.to_bytes())
+    }
+
+    pub fn transport_probe_frame(&self, note: &str) -> Result<Vec<u8>, ProtocolError> {
+        let mut message_id = MessageId([0; 16]);
+        OsRng.fill_bytes(&mut message_id.0);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_secs())
+            .unwrap_or_default();
+        let envelope = Envelope {
+            protocol_version: crate::protocol::PROTOCOL_VERSION,
+            message_id,
+            sender_identity: self.identity_id(),
+            recipient: Recipient::Peer(self.identity_id()),
+            message_type: MessageType::CONTROL,
+            created_at: now,
+            expires_at: now + 60,
+            routing: RoutingMetadata {
+                hop_count: 0,
+                hop_limit: 0,
+            },
+            encrypted_payload: BoundedBytes::new(
+                format!("GHOST-PROBE {}\0{note}", self.username()).into_bytes(),
+            )?,
+            authentication_data: self.sign(b"ghost-transport-probe"),
+        };
+        encode_frame(&envelope)
     }
 }
 
@@ -621,5 +652,25 @@ mod tests {
             store.load(passphrase()),
             Err(IdentityError::InsecurePermissions)
         ));
+    }
+
+    #[test]
+    fn transport_probe_frame_is_valid_and_signed() {
+        let dir = tempdir().unwrap();
+        let store = IdentityStore::new(dir.path().join("identity.ghost"));
+        let identity = store.create("ada", passphrase()).unwrap();
+
+        let frame = identity.transport_probe_frame("hello").unwrap();
+        let envelope = crate::protocol::decode_frame(&frame, now_for_test()).unwrap();
+        assert_eq!(envelope.sender_identity, identity.identity_id());
+        assert_eq!(envelope.message_type, MessageType::CONTROL);
+        assert!(!envelope.authentication_data.is_zero());
+    }
+
+    fn now_for_test() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
     }
 }

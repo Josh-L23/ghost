@@ -12,8 +12,10 @@ pub enum Command {
     Block(String),
     Unblock(String),
     Scan,
+    Listen(SocketAddr),
     Connect(SocketAddr),
-    Disconnect(String),
+    Ping(SocketAddr),
+    Disconnect(SocketAddr),
     Message { peer: String, text: String },
     Open(String),
     History(Option<String>),
@@ -69,11 +71,22 @@ pub fn parse(input: &str) -> Result<Command, CommandError> {
         ("block", [peer]) => Ok(Command::Block(peer.clone())),
         ("unblock", [peer]) => Ok(Command::Unblock(peer.clone())),
         ("scan", []) => Ok(Command::Scan),
+        ("listen", [address]) => address
+            .parse()
+            .map(Command::Listen)
+            .map_err(|_| CommandError("Usage: /listen <ip:port>".into())),
         ("connect", [address]) => address
             .parse()
             .map(Command::Connect)
             .map_err(|_| CommandError("Usage: /connect <ip:port>".into())),
-        ("disconnect", [peer]) => Ok(Command::Disconnect(peer.clone())),
+        ("ping", [address]) => address
+            .parse()
+            .map(Command::Ping)
+            .map_err(|_| CommandError("Usage: /ping <ip:port>".into())),
+        ("disconnect", [address]) => address
+            .parse()
+            .map(Command::Disconnect)
+            .map_err(|_| CommandError("Usage: /disconnect <ip:port>".into())),
         ("msg", [peer, rest @ ..]) if !rest.is_empty() => Ok(Command::Message {
             peer: peer.clone(),
             text: rest.join(" "),
@@ -159,5 +172,18 @@ mod tests {
             Command::Unblock("ada".into())
         );
         assert!(parse("/verify ada").is_err());
+    }
+
+    #[test]
+    fn parses_transport_commands() {
+        assert_eq!(
+            parse("/listen 127.0.0.1:9000").unwrap(),
+            Command::Listen("127.0.0.1:9000".parse().unwrap())
+        );
+        assert_eq!(
+            parse("/ping 127.0.0.1:9001").unwrap(),
+            Command::Ping("127.0.0.1:9001".parse().unwrap())
+        );
+        assert!(parse("/listen nope").is_err());
     }
 }
