@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     error::Error,
     io,
     net::SocketAddr,
@@ -13,7 +14,7 @@ use crossterm::{
 use ghost_core::{
     command::{self, Command},
     identity::{self, Identity, IdentityError, IdentityStore},
-    protocol::decode_frame,
+    session::{self, EstablishedSession, PendingSession},
     trust::{self, TrustRecord, TrustStore},
 };
 use ghost_network::{ConnectionState, TransportCommand, TransportEvent, TransportHandle};
@@ -39,6 +40,8 @@ struct App {
     transport: TransportHandle,
     connections: Vec<(SocketAddr, ConnectionState)>,
     listen_addr: Option<SocketAddr>,
+    handshakes: HashMap<SocketAddr, PendingSession>,
+    sessions: HashMap<SocketAddr, EstablishedSession>,
 }
 
 impl App {
@@ -57,6 +60,8 @@ impl App {
             transport,
             connections: Vec::new(),
             listen_addr: None,
+            handshakes: HashMap::new(),
+            sessions: HashMap::new(),
         };
         app.lines.push(format!(
             "Welcome, {username}. Your local identity is ready."
@@ -85,8 +90,8 @@ impl App {
                 "          /relay status|enable|disable /clear /quit".into(),
                 "/whoami shows your username and identity fingerprint.".into(),
                 "Peers may be selected by label, short fingerprint, or full fingerprint.".into(),
-                "TCP is manual-only; frames are bounded and time-limited.".into(),
-                "Storage and relay services are not implemented yet.".into(),
+                "TCP is manual-only; sessions require verified peer fingerprints.".into(),
+                "Storage, end-to-end messaging, and relay services are not implemented yet.".into(),
             ]),
             Ok(Command::WhoAmI) => {
                 self.lines
@@ -110,7 +115,14 @@ impl App {
                 } else {
                     self.lines.push("Connections:".into());
                     for (peer, state) in &self.connections {
-                        self.lines.push(format!("  [{state:?}] {peer}"));
+                        let session = if self.sessions.contains_key(peer) {
+                            "verified session"
+                        } else if self.handshakes.contains_key(peer) {
+                            "handshaking"
+                        } else {
+                            "no session"
+                        };
+                        self.lines.push(format!("  [{state:?}] {peer} — {session}"));
                     }
                 }
                 if self.trust.records().is_empty() {
@@ -165,16 +177,27 @@ impl App {
                 self.set_connection_state(address, ConnectionState::Disconnected);
                 self.lines.push(format!("Closing connection to {address}."));
             }
-            Ok(Command::Ping(address)) => match self.identity.transport_probe_frame("ping") {
-                Ok(frame) => {
-                    self.send_command(TransportCommand::Send {
-                        peer: address,
-                        frame,
-                    });
-                    self.lines.push(format!("Probe queued for {address}."));
+            Ok(Command::Ping(address)) => {
+                let plaintext = format!("PING from {}", self.identity_label);
+                let framed = self.sessions.get_mut(&address).and_then(|session| {
+                    session
+                        .encrypt(&self.identity, plaintext.as_bytes(), now())
+                        .ok()
+                });
+                match framed {
+                    Some(frame) => {
+                        self.send_command(TransportCommand::Send {
+                            peer: address,
+                            frame,
+                        });
+                        self.lines
+                            .push(format!("Encrypted probe queued for {address}."));
+                    }
+                    None => self.lines.push(format!(
+                        "No established session with {address}. Verify the peer fingerprint first."
+                    )),
                 }
-                Err(error) => self.lines.push(format!("Could not build probe: {error}")),
-            },
+            }
             Ok(Command::Clear) => self.lines.clear(),
             Ok(Command::Quit) => self.should_quit = true,
             Ok(_) => self
@@ -195,36 +218,82 @@ impl App {
                 }
                 TransportEvent::Incoming(peer) => {
                     self.set_connection_state(peer, ConnectionState::Connected);
-                    self.lines.push(format!(
-                        "[INCOMING] {peer} connected. Use /peers to inspect it."
-                    ));
+                    self.lines.push(format!("[INCOMING] {peer} connected."));
+                    self.start_handshake(peer);
                 }
                 TransportEvent::Connected(peer) => {
                     self.set_connection_state(peer, ConnectionState::Connected);
                     self.lines.push(format!("[CONNECTED] {peer}"));
+                    self.start_handshake(peer);
                 }
                 TransportEvent::Disconnected(peer, reason) => {
                     self.set_connection_state(peer, ConnectionState::Disconnected);
+                    self.handshakes.remove(&peer);
+                    self.sessions.remove(&peer);
                     self.lines.push(format!("[DISCONNECTED] {peer}: {reason}"));
                 }
-                TransportEvent::Frame { peer, frame } => {
-                    self.lines
-                        .push(format!("[FRAME] {peer}: {} bytes", frame.len()));
-                    match decode_frame(&frame, now()) {
-                        Ok(envelope) => self.lines.push(format!(
-                            "  type={} sender={} payload={} bytes",
-                            envelope.message_type.0,
-                            envelope.sender_identity,
-                            envelope.encrypted_payload.as_slice().len()
-                        )),
-                        Err(error) => self.lines.push(format!("  invalid frame ignored: {error}")),
-                    }
-                }
+                TransportEvent::Frame { peer, frame } => self.handle_session_frame(peer, frame),
                 TransportEvent::Error { peer, message } => {
                     let peer = peer.map(|peer| peer.to_string()).unwrap_or_default();
                     self.lines.push(format!("[NETWORK] {peer} {message}"));
                 }
             }
+        }
+    }
+
+    fn start_handshake(&mut self, peer: SocketAddr) {
+        if self.sessions.contains_key(&peer) || self.handshakes.contains_key(&peer) {
+            return;
+        }
+        match session::initiate(&self.identity) {
+            Ok((pending, hello)) => {
+                self.send_command(TransportCommand::Send { peer, frame: hello });
+                self.handshakes.insert(peer, pending);
+                self.lines
+                    .push(format!("[SESSION] Authentication started with {peer}."));
+            }
+            Err(error) => self
+                .lines
+                .push(format!("[SESSION] Could not start authentication: {error}")),
+        }
+    }
+
+    fn handle_session_frame(&mut self, peer: SocketAddr, frame: Vec<u8>) {
+        if let Some(pending) = self.handshakes.remove(&peer) {
+            match pending.complete(&self.identity, &mut self.trust, &frame, now()) {
+                Ok(session) => {
+                    self.lines.push(format!(
+                        "[SESSION] Verified {} ({}) with fingerprint {}.",
+                        session.peer_label(),
+                        session.peer_id(),
+                        session::fingerprint_of(&session.peer_id())
+                    ));
+                    self.sessions.insert(peer, session);
+                }
+                Err(error) => {
+                    self.lines
+                        .push(format!("[SESSION] Refused {peer}: {error}"));
+                    self.send_command(TransportCommand::Disconnect(peer));
+                }
+            }
+            return;
+        }
+
+        if let Some(session) = self.sessions.get_mut(&peer) {
+            match session.decrypt(&frame, now()) {
+                Ok(plaintext) => self.lines.push(format!(
+                    "[SESSION] {}: {}",
+                    peer,
+                    String::from_utf8_lossy(&plaintext)
+                )),
+                Err(error) => self
+                    .lines
+                    .push(format!("[SESSION] Rejected frame from {peer}: {error}")),
+            }
+        } else {
+            self.lines.push(format!(
+                "[SESSION] Unexpected frame from {peer} before authentication."
+            ));
         }
     }
 
@@ -378,10 +447,11 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
         .count();
     frame.render_widget(
         Paragraph::new(format!(
-            "Identity: {} ({})  |  Links: {}  |  Peers: {} ({} verified)  |  Ctrl-C: quit",
+            "Identity: {} ({})  |  Links: {} ({} sessions)  |  Peers: {} ({} verified)  |  Ctrl-C: quit",
             app.identity_label,
             app.fingerprint_short,
             connected,
+            app.sessions.len(),
             app.trust.records().len(),
             verified
         )),

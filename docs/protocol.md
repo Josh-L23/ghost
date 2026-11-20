@@ -1,6 +1,6 @@
 # GHOST v1 wire protocol and cryptographic design
 
-Status: proposed v1 design reviewed against the technical blueprint. It is not an external security audit and is not a production-security claim. `ghost-core` implements the envelope types, framing, validation rules, identity, and trust records; `ghost-network` implements bounded manual TCP transport. Authenticated sessions and message cryptography are tracked in separate issues.
+Status: proposed v1 design reviewed against the technical blueprint. It is not an external security audit and is not a production-security claim. `ghost-core` implements the envelope types, framing, validation rules, identity, trust records, and authenticated ephemeral sessions; `ghost-network` implements bounded manual TCP transport. End-to-end message cryptography, receipts, and storage are tracked in separate issues.
 
 Source: [technical blueprint](<PROJECT GHOST — Technical Specification and Implementation Blueprint.md>) sections 6, 7.4, 8, 9, 12, 13, 16, and 17.
 
@@ -73,6 +73,8 @@ The nonce is 96 bits of randomness from the OS CSPRNG and must never repeat unde
 5. All subsequent frames use ChaCha20-Poly1305 with keys derived from that session secret.
 6. A version mismatch or failed authentication closes the connection with a non-sensitive error before any application content is processed.
 7. Session keys are rotated on reconnect and after a bounded number of messages or time interval; the concrete rekey threshold is set when authenticated sessions are implemented.
+
+The implemented handshake sends a signed `CONTROL` hello from each side. Each hello carries the sender's identity key, an ephemeral X25519 public key, a random challenge, a username label, and timestamps. Both peers derive the same transcript hash by sorting the two hellos by identity key, then use HKDF-SHA256 over the ECDH secret, sorted challenges, transcript hash, and a domain separator. A session is created only when both peers use protocol version 1 and the local trust state is `VERIFIED`; unverified, blocked, and key-changed peers are refused before application data is processed. Session key material is held in zeroizing buffers and discarded when the connection closes.
 
 Transport security and end-to-end encryption are separate: a secure session does not give a relay permission to decrypt content, and a transport write does not prove delivery.
 
