@@ -1,6 +1,7 @@
 use std::{
     error::Error,
     io,
+    net::SocketAddr,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -12,8 +13,10 @@ use crossterm::{
 use ghost_core::{
     command::{self, Command},
     identity::{self, Identity, IdentityError, IdentityStore},
+    protocol::decode_frame,
     trust::{self, TrustRecord, TrustStore},
 };
+use ghost_network::{ConnectionState, TransportCommand, TransportEvent, TransportHandle};
 use ratatui::{
     Terminal,
     backend::CrosstermBackend,
@@ -32,11 +35,16 @@ struct App {
     fingerprint_short: String,
     fingerprint_full: String,
     trust: TrustStore,
+    identity: Identity,
+    transport: TransportHandle,
+    connections: Vec<(SocketAddr, ConnectionState)>,
+    listen_addr: Option<SocketAddr>,
 }
 
 impl App {
-    fn new(identity: &Identity, trust: TrustStore) -> Self {
+    fn new(identity: Identity, trust: TrustStore, transport: TransportHandle) -> Self {
         let fingerprint = identity.fingerprint();
+        let username = identity.username().to_owned();
         let mut app = Self {
             input: String::new(),
             lines: Vec::new(),
@@ -45,10 +53,13 @@ impl App {
             fingerprint_short: fingerprint.short(),
             fingerprint_full: fingerprint.full(),
             trust,
+            identity,
+            transport,
+            connections: Vec::new(),
+            listen_addr: None,
         };
         app.lines.push(format!(
-            "Welcome, {}. Your local identity is ready.",
-            identity.username()
+            "Welcome, {username}. Your local identity is ready."
         ));
         app.lines.push(
             "Unverified peers are never trusted automatically; compare fingerprints out-of-band."
@@ -68,13 +79,14 @@ impl App {
         match command::parse(&input) {
             Ok(Command::Help) => self.lines.extend([
                 "Commands: /help /whoami /peers /verify <peer> <fingerprint>".into(),
-                "          /block <peer> /unblock <peer> /scan /connect <ip:port>".into(),
-                "          /disconnect <peer> /msg <peer> <text> /open <peer>".into(),
-                "          /history [peer|group] /relay status|enable|disable".into(),
-                "          /clear /quit".into(),
+                "          /block <peer> /unblock <peer> /scan /listen <ip:port>".into(),
+                "          /connect <ip:port> /disconnect <ip:port> /ping <ip:port>".into(),
+                "          /msg <peer> <text> /open <peer> /history [peer|group]".into(),
+                "          /relay status|enable|disable /clear /quit".into(),
                 "/whoami shows your username and identity fingerprint.".into(),
                 "Peers may be selected by label, short fingerprint, or full fingerprint.".into(),
-                "Network, storage, and relay services are not implemented yet.".into(),
+                "TCP is manual-only; frames are bounded and time-limited.".into(),
+                "Storage and relay services are not implemented yet.".into(),
             ]),
             Ok(Command::WhoAmI) => {
                 self.lines
@@ -87,6 +99,20 @@ impl App {
                     .push("Compare the fingerprint out-of-band before trusting a peer.".into());
             }
             Ok(Command::Peers) => {
+                self.lines.push(format!(
+                    "Listener: {}",
+                    self.listen_addr
+                        .map(|address| address.to_string())
+                        .unwrap_or_else(|| "starting".into())
+                ));
+                if self.connections.is_empty() {
+                    self.lines.push("Connections: none".into());
+                } else {
+                    self.lines.push("Connections:".into());
+                    for (peer, state) in &self.connections {
+                        self.lines.push(format!("  [{state:?}] {peer}"));
+                    }
+                }
                 if self.trust.records().is_empty() {
                     self.lines
                         .push("No known peers. Connect to a peer to learn its identity.".into());
@@ -124,12 +150,99 @@ impl App {
                 )),
                 Err(error) => self.lines.push(format!("Unblock failed: {error}")),
             },
+            Ok(Command::Listen(address)) => {
+                self.send_command(TransportCommand::Listen(address));
+                self.lines
+                    .push(format!("Requesting listener on {address}."));
+            }
+            Ok(Command::Connect(address)) => {
+                self.set_connection_state(address, ConnectionState::Connecting);
+                self.send_command(TransportCommand::Connect(address));
+                self.lines.push(format!("Connecting to {address}."));
+            }
+            Ok(Command::Disconnect(address)) => {
+                self.send_command(TransportCommand::Disconnect(address));
+                self.set_connection_state(address, ConnectionState::Disconnected);
+                self.lines.push(format!("Closing connection to {address}."));
+            }
+            Ok(Command::Ping(address)) => match self.identity.transport_probe_frame("ping") {
+                Ok(frame) => {
+                    self.send_command(TransportCommand::Send {
+                        peer: address,
+                        frame,
+                    });
+                    self.lines.push(format!("Probe queued for {address}."));
+                }
+                Err(error) => self.lines.push(format!("Could not build probe: {error}")),
+            },
             Ok(Command::Clear) => self.lines.clear(),
             Ok(Command::Quit) => self.should_quit = true,
             Ok(_) => self
                 .lines
                 .push("This command is recognized, but its service is not implemented yet.".into()),
             Err(error) => self.lines.push(format!("Error: {error}")),
+        }
+    }
+
+    fn drain_events(&mut self) {
+        while let Some(event) = self.transport.try_event() {
+            match event {
+                TransportEvent::Listening(address) => {
+                    self.listen_addr = Some(address);
+                    self.lines.push(format!(
+                        "[LISTENING] Accepting manual connections on {address}."
+                    ));
+                }
+                TransportEvent::Incoming(peer) => {
+                    self.set_connection_state(peer, ConnectionState::Connected);
+                    self.lines.push(format!(
+                        "[INCOMING] {peer} connected. Use /peers to inspect it."
+                    ));
+                }
+                TransportEvent::Connected(peer) => {
+                    self.set_connection_state(peer, ConnectionState::Connected);
+                    self.lines.push(format!("[CONNECTED] {peer}"));
+                }
+                TransportEvent::Disconnected(peer, reason) => {
+                    self.set_connection_state(peer, ConnectionState::Disconnected);
+                    self.lines.push(format!("[DISCONNECTED] {peer}: {reason}"));
+                }
+                TransportEvent::Frame { peer, frame } => {
+                    self.lines
+                        .push(format!("[FRAME] {peer}: {} bytes", frame.len()));
+                    match decode_frame(&frame, now()) {
+                        Ok(envelope) => self.lines.push(format!(
+                            "  type={} sender={} payload={} bytes",
+                            envelope.message_type.0,
+                            envelope.sender_identity,
+                            envelope.encrypted_payload.as_slice().len()
+                        )),
+                        Err(error) => self.lines.push(format!("  invalid frame ignored: {error}")),
+                    }
+                }
+                TransportEvent::Error { peer, message } => {
+                    let peer = peer.map(|peer| peer.to_string()).unwrap_or_default();
+                    self.lines.push(format!("[NETWORK] {peer} {message}"));
+                }
+            }
+        }
+    }
+
+    fn set_connection_state(&mut self, peer: SocketAddr, state: ConnectionState) {
+        if let Some(entry) = self
+            .connections
+            .iter_mut()
+            .find(|(address, _)| *address == peer)
+        {
+            entry.1 = state;
+        } else {
+            self.connections.push((peer, state));
+        }
+    }
+
+    fn send_command(&mut self, command: TransportCommand) {
+        if let Err(error) = self.transport.command(command) {
+            self.lines.push(format!("Transport error: {error}"));
         }
     }
 }
@@ -175,9 +288,15 @@ fn main() -> Result<(), Box<dyn Error>> {
 fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<(), Box<dyn Error>> {
     let identity = setup_identity(terminal)?;
     let trust = TrustStore::load_or_empty(trust::default_trust_path()?)?;
-    let mut app = App::new(&identity, trust);
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let _guard = runtime.enter();
+    let transport = ghost_network::start(ghost_network::default_listen_addr())?;
+    let mut app = App::new(identity, trust, transport);
 
     while !app.should_quit {
+        app.drain_events();
         terminal.draw(|frame| draw(frame, &app))?;
         if event::poll(Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
@@ -200,6 +319,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<(), Box<
             }
         }
     }
+    app.transport.shutdown();
     Ok(())
 }
 
@@ -214,6 +334,10 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
         ])
         .split(frame.area());
 
+    let listener = app
+        .listen_addr
+        .map(|address| format!("LISTENING {address}"))
+        .unwrap_or_else(|| "LISTENER STARTING".into());
     let header = Paragraph::new(Line::from(vec![
         Span::styled(
             " GHOST ",
@@ -222,7 +346,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
                 .bg(Color::Green)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::raw("  LOCAL CONSOLE  ·  NETWORK OFFLINE  ·  RELAY DISABLED"),
+        Span::raw(format!("  LOCAL CONSOLE  ·  {listener}  ·  RELAY DISABLED")),
     ]))
     .block(Block::default().borders(Borders::BOTTOM));
     frame.render_widget(header, areas[0]);
@@ -247,11 +371,17 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
         .iter()
         .filter(|record| record.state == trust::TrustState::Verified)
         .count();
+    let connected = app
+        .connections
+        .iter()
+        .filter(|(_, state)| *state == ConnectionState::Connected)
+        .count();
     frame.render_widget(
         Paragraph::new(format!(
-            "Identity: {} ({})  |  Peers: {} ({} verified)  |  Ctrl-C: quit",
+            "Identity: {} ({})  |  Links: {}  |  Peers: {} ({} verified)  |  Ctrl-C: quit",
             app.identity_label,
             app.fingerprint_short,
+            connected,
             app.trust.records().len(),
             verified
         )),

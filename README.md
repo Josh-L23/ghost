@@ -8,13 +8,14 @@ What if you could talk to you'r computer science geeks through the terminal ? Sa
 
 ## Current state
 
-- Rust workspace with a UI-independent `ghost-core` crate and a Ratatui/Crossterm terminal shell.
+- Rust workspace with UI-independent `ghost-core` and `ghost-network` crates and a Ratatui/Crossterm terminal shell.
 - Slash commands are parsed, including quoted arguments and backslash escaping.
 - A versioned wire envelope with bounded validation rules, a passphrase-protected local identity, and a persistent peer trust store are defined in `ghost-core`.
 - Trust state is `UNVERIFIED`, `VERIFIED`, or `BLOCKED`; `/verify` requires the full fingerprint and survives restart.
 - The terminal shows a header, an activity timeline, a command line, and a status line.
+- Manual bounded TCP connections use Tokio in `ghost-network`; `/ping` exchanges a framed, signed control probe.
 - Recognized commands whose services do not exist yet report that they are not implemented.
-- Manual TCP connections, authenticated sessions, encrypted messaging, and message-history persistence are planned work, not features.
+- Authenticated sessions, encrypted messaging, and message-history persistence are planned work, not features.
 
 ## Run
 
@@ -26,12 +27,12 @@ cargo run -p ghost-terminal
 
 On first launch the terminal asks for a username and passphrase, then stores an encrypted identity under `~/.local/share/ghost/identity.ghost` (or `$XDG_DATA_HOME/ghost/identity.ghost`). Later launches ask for the passphrase to unlock it; no secret is printed.
 
-Inside the terminal, use `/help` for the built-in command list. `/quit`, Escape, or Ctrl-C exits cleanly.
+Inside the terminal, use `/help` for the built-in command list. `/quit`, Escape, or Ctrl-C exits cleanly. The listener defaults to `127.0.0.1:0`; set `GHOST_LISTEN` to choose another bind address or use `/listen <ip:port>`. Share the printed listening address with the other terminal, then use `/connect <ip:port>` and `/ping <ip:port>`.
 
 | COMMAND | STATUS |
 | --- | --- |
-| `/help`, `/whoami`, `/peers`, `/verify <peer> <fingerprint>`, `/block <peer>`, `/unblock <peer>`, `/clear`, `/quit` | Working in the terminal shell |
-| `/scan`, `/connect <ip:port>`, `/disconnect <peer>`, `/msg <peer> <text>`, `/open <peer>`, `/history [peer\|group]`, `/relay status\|enable\|disable` | Parsed, but the backing service is not implemented |
+| `/help`, `/whoami`, `/peers`, `/verify <peer> <fingerprint>`, `/block <peer>`, `/unblock <peer>`, `/listen <ip:port>`, `/connect <ip:port>`, `/disconnect <ip:port>`, `/ping <ip:port>`, `/clear`, `/quit` | Working in the terminal shell |
+| `/scan`, `/msg <peer> <text>`, `/open <peer>`, `/history [peer\|group]`, `/relay status\|enable\|disable` | Parsed, but the backing service is not implemented |
 | `/group create\|invite\|send` | Planned; currently reported as not implemented |
 
 Message text must be entered with `/msg <peer> <text>`; bare text is not treated as a message yet.
@@ -41,6 +42,7 @@ Message text must be entered with `/msg <peer> <text>`; bare text is not treated
 ```text
 crates/
   ghost-core/       UI- and transport-independent commands and events
+  ghost-network/    Bounded transport adapters (Tokio TCP first)
   ghost-terminal/   Ratatui client shell (initial Linux development target)
 docs/
   PROJECT GHOST — Technical Specification and Implementation Blueprint.md
