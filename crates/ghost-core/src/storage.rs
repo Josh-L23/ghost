@@ -20,7 +20,7 @@ use crate::{
     trust::{TrustRecord, TrustState},
 };
 
-const SCHEMA_VERSION: i32 = 2;
+const SCHEMA_VERSION: i32 = 3;
 const MAX_PENDING: usize = 32;
 const MAX_DEDUP: usize = dedup::MAX_DEDUP_ENTRIES;
 
@@ -144,6 +144,10 @@ impl Storage {
         }
         if version == 1 {
             self.migrate_to_v2()?;
+            version = 2;
+        }
+        if version == 2 {
+            self.migrate_to_v3()?;
         }
         Ok(())
     }
@@ -216,6 +220,26 @@ impl Storage {
             );
             CREATE INDEX IF NOT EXISTS idx_history_conversation
                 ON message_history(conversation_id, created_at);
+            ",
+        )?;
+        tx.pragma_update(None, "user_version", 2)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn migrate_to_v3(&mut self) -> Result<(), StorageError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS history_settings (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+                retention_max_messages INTEGER NOT NULL DEFAULT 500
+            );
+            INSERT OR IGNORE INTO history_settings (id, enabled, retention_max_messages)
+                VALUES (1, 1, 500);
             ",
         )?;
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -545,6 +569,83 @@ fn bytes_to_id16(bytes: &[u8]) -> Result<[u8; 16], StorageError> {
 }
 
 impl Storage {
+    pub fn history_enabled(&self) -> Result<bool, StorageError> {
+        self.ensure_history_settings()?;
+        let enabled: i64 = self.conn.query_row(
+            "SELECT enabled FROM history_settings WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(enabled != 0)
+    }
+
+    pub fn set_history_enabled(&mut self, enabled: bool) -> Result<(), StorageError> {
+        self.ensure_history_settings()?;
+        self.conn.execute(
+            "UPDATE history_settings SET enabled = ?1 WHERE id = 1",
+            params![if enabled { 1i64 } else { 0i64 }],
+        )?;
+        Ok(())
+    }
+
+    pub fn history_retention_max_messages(&self) -> Result<u64, StorageError> {
+        self.ensure_history_settings()?;
+        let value: i64 = self.conn.query_row(
+            "SELECT retention_max_messages FROM history_settings WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(value.max(0) as u64)
+    }
+
+    pub fn set_history_retention_max_messages(&mut self, max: u64) -> Result<(), StorageError> {
+        self.ensure_history_settings()?;
+        let max = (max.min(10_000)) as i64;
+        self.conn.execute(
+            "UPDATE history_settings SET retention_max_messages = ?1 WHERE id = 1",
+            params![max],
+        )?;
+        Ok(())
+    }
+
+    fn ensure_history_settings(&self) -> Result<(), StorageError> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO history_settings (id, enabled, retention_max_messages) VALUES (1, 1, 500)",
+            [],
+        )?;
+        Ok(())
+    }
+
+    pub fn clear_history(&mut self, conversation_id: Option<&str>) -> Result<usize, StorageError> {
+        let changed = if let Some(conversation_id) = conversation_id {
+            self.conn.execute(
+                "DELETE FROM message_history WHERE conversation_id = ?1",
+                params![conversation_id],
+            )?
+        } else {
+            self.conn.execute("DELETE FROM message_history", [])?
+        };
+        Ok(changed)
+    }
+
+    pub fn prune_history(&mut self, max_messages: u64) -> Result<usize, StorageError> {
+        let count: i64 =
+            self.conn
+                .query_row("SELECT COUNT(*) FROM message_history", [], |row| row.get(0))?;
+        let count = count.max(0) as u64;
+        if count <= max_messages {
+            return Ok(0);
+        }
+        let to_delete = count - max_messages;
+        let deleted = self.conn.execute(
+            "DELETE FROM message_history WHERE message_id IN (
+                SELECT message_id FROM message_history ORDER BY created_at ASC, rowid ASC LIMIT ?1
+            )",
+            params![to_delete as i64],
+        )?;
+        Ok(deleted)
+    }
+
     pub fn store_history(&mut self, record: &EncryptedHistoryRecord) -> Result<(), StorageError> {
         self.conn.execute(
             "INSERT OR REPLACE INTO message_history
@@ -561,6 +662,8 @@ impl Storage {
                 record.ciphertext.as_slice(),
             ],
         )?;
+        let retention = self.history_retention_max_messages().unwrap_or(500);
+        let _ = self.prune_history(retention);
         Ok(())
     }
 
@@ -907,5 +1010,70 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, StorageError::Corrupt(_)));
         assert!(!err.to_string().contains("sensitive"));
+    }
+
+    #[test]
+    fn history_controls_disable_clear_and_retention() {
+        use crate::history::{HistoryRecord, encrypt_record};
+        use zeroize::Zeroizing;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("ghost.db");
+        let key = Zeroizing::new([5u8; 32]);
+        let mut storage = Storage::open(&path).unwrap();
+        assert!(storage.history_enabled().unwrap());
+        storage.set_history_enabled(false).unwrap();
+        assert!(!storage.history_enabled().unwrap());
+        storage.set_history_enabled(true).unwrap();
+
+        for i in 0u8..5 {
+            let record = HistoryRecord {
+                message_id: MessageId([i; 16]),
+                conversation_id: if i % 2 == 0 { "a".into() } else { "b".into() },
+                sender: IdentityId([1; 32]),
+                recipient: IdentityId([2; 32]),
+                created_at: i as u64,
+                outgoing: true,
+                body: format!("msg-{i}"),
+            };
+            let encrypted = encrypt_record(&record, &key).unwrap();
+            storage.store_history(&encrypted).unwrap();
+        }
+        assert_eq!(storage.load_history(None).unwrap().len(), 5);
+        let removed = storage.clear_history(Some("a")).unwrap();
+        assert!(removed >= 1);
+        assert!(storage.load_history(Some("a")).unwrap().is_empty());
+        storage.clear_history(None).unwrap();
+        assert!(storage.load_history(None).unwrap().is_empty());
+
+        storage.set_history_retention_max_messages(2).unwrap();
+        for i in 10u8..14 {
+            let record = HistoryRecord {
+                message_id: MessageId([i; 16]),
+                conversation_id: "c".into(),
+                sender: IdentityId([1; 32]),
+                recipient: IdentityId([2; 32]),
+                created_at: i as u64,
+                outgoing: false,
+                body: format!("msg-{i}"),
+            };
+            let encrypted = encrypt_record(&record, &key).unwrap();
+            storage.store_history(&encrypted).unwrap();
+        }
+        assert!(storage.load_history(None).unwrap().len() <= 2);
+    }
+
+    #[test]
+    fn history_settings_survive_restart() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("ghost.db");
+        {
+            let mut storage = Storage::open(&path).unwrap();
+            storage.set_history_enabled(false).unwrap();
+            storage.set_history_retention_max_messages(123).unwrap();
+        }
+        let storage = Storage::open(&path).unwrap();
+        assert!(!storage.history_enabled().unwrap());
+        assert_eq!(storage.history_retention_max_messages().unwrap(), 123);
     }
 }
