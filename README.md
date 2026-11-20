@@ -29,8 +29,8 @@ Inside the terminal, use `/help` for the built-in command list. `/quit`, Escape,
 
 | COMMAND | STATUS |
 | --- | --- |
-| `/help`, `/clear`, `/quit` | Working in the terminal shell |
-| `/whoami`, `/peers`, `/scan`, `/connect <ip:port>`, `/disconnect <peer>`, `/msg <peer> <text>`, `/open <peer>`, `/history [peer\|group]`, `/relay status\|enable\|disable` | Parsed, but the backing service is not implemented |
+| `/help`, `/whoami`, `/clear`, `/quit` | Working in the terminal shell |
+| `/peers`, `/scan`, `/connect <ip:port>`, `/disconnect <peer>`, `/msg <peer> <text>`, `/open <peer>`, `/history [peer\|group]`, `/relay status\|enable\|disable` | Parsed, but the backing service is not implemented |
 | `/group create\|invite\|send` | Planned; currently reported as not implemented |
 
 Message text must be entered with `/msg <peer> <text>`; bare text is not treated as a message yet.

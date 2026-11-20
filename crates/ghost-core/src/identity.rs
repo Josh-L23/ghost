@@ -161,7 +161,7 @@ impl Identity {
     }
 
     pub fn fingerprint(&self) -> Fingerprint {
-        Fingerprint(Sha256::digest(self.public_key.to_bytes()).into())
+        fingerprint_from_public_key(&self.public_key.to_bytes())
     }
 
     pub fn sign(&self, message: &[u8]) -> Signature {
@@ -331,6 +331,10 @@ pub fn default_identity_path() -> Result<PathBuf, IdentityError> {
         })
         .ok_or(IdentityError::DataDirectoryUnavailable)?;
     Ok(base.join("ghost").join("identity.ghost"))
+}
+
+pub fn fingerprint_from_public_key(public_key: &[u8; 32]) -> Fingerprint {
+    Fingerprint(Sha256::digest(public_key).into())
 }
 
 pub fn is_valid_username(username: &str) -> bool {
@@ -549,6 +553,16 @@ mod tests {
         assert_eq!(first.fingerprint().short().len(), 16);
         assert_eq!(first.fingerprint().full(), first.fingerprint().to_string());
         assert_ne!(first.fingerprint(), second.fingerprint());
+    }
+
+    #[test]
+    fn fingerprint_matches_known_vector() {
+        let fingerprint = fingerprint_from_public_key(&[1u8; 32]);
+        assert_eq!(
+            fingerprint.full(),
+            "72cd6e8422c407fb6d098690f1130b7ded7ec2f7f5e1d30bd9d521f015363793"
+        );
+        assert_eq!(fingerprint.short(), "72cd6e8422c407fb");
     }
 
     #[test]
