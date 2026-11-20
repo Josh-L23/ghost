@@ -1,6 +1,8 @@
 //! UI- and transport-independent concepts for GHOST.
 //!
-//! Security-sensitive protocol and identity code is intentionally not present yet.
+//! Identity, transport, and cryptographic services are not implemented yet.
+//! The wire envelope and its validation rules are defined in [`protocol`].
 
 pub mod command;
 pub mod event;
+pub mod protocol;
