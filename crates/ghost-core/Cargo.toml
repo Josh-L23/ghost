@@ -7,4 +7,6 @@ license.workspace = true
 description = "Transport- and UI-independent application concepts for Project GHOST"
 
 [dependencies]
+postcard = { version = "1", features = ["alloc"] }
+serde = { version = "1", features = ["derive"] }
 

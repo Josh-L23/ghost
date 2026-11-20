@@ -1,15 +1,16 @@
 # PROJECT GHOST
 
-A local-first, peer-to-peer terminal messenger: talk to trusted people on your local network without a central message server.
-
-The idea started with a simple question: what if you could talk to your computer science peers through the terminal? It is also a learning project for encryption, user groups and permissions, and Linux networking. It is not a professionally audited secure-messaging product.
-
-> **Status: early scaffold.** The command parser and terminal view work, but identity, trust, networking, encryption, storage, discovery, groups, and relaying are not implemented. No security properties are claimed yet.
+What if you could talk to you'r computer science geeks through the terminal ? Say less. thats what we are working on here. A Local Peer to Peer terminal chat interface that uses ur local network (wifi and bluetooth) to connect the devices you permit, to participate in communication, Secure ? Probably not, im building this to pracice some things from my Semester Courses
+1. Encryption Algorithms (Cyber)
+2. User Groups and Permissions (Linux Sys Admin)
+3. Networking (Linux)
+4. Fun
 
 ## Current state
 
 - Rust workspace with a UI-independent `ghost-core` crate and a Ratatui/Crossterm terminal shell.
 - Slash commands are parsed, including quoted arguments and backslash escaping.
+- A versioned wire envelope with bounded validation rules is defined in `ghost-core`; no transport or cryptographic services are wired up yet.
 - The terminal shows a header, an activity timeline, a command line, and a status line.
 - Recognized commands whose services do not exist yet report that they are not implemented.
 - Manual TCP connections, authenticated sessions, encrypted messaging, and persistence are planned work, not features.
@@ -48,6 +49,7 @@ docs/
 
 - [Technical specification and implementation blueprint](<docs/PROJECT GHOST — Technical Specification and Implementation Blueprint.md>) — the source document for product scope, architecture, threat model, development stages, risks, and release criteria.
 - [Architecture and implementation sequence](docs/architecture.md) — crate boundaries and the short staged plan.
+- [Wire protocol and cryptographic design](docs/protocol.md) — envelope, framing, validation limits, threat model, and conservative security claims.
 - [Tracked issues](https://github.com/Josh-L23/ghost/issues) — actionable work grouped by area with acceptance criteria and dependencies.
 
 ## Development direction
