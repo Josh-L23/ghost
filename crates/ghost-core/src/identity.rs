@@ -173,6 +173,16 @@ impl Identity {
         Signature(signature.to_bytes())
     }
 
+    pub fn history_key(&self) -> Zeroizing<[u8; 32]> {
+        use hkdf::Hkdf;
+        use sha2::Sha256;
+        let hk = Hkdf::<Sha256>::new(Some(b"ghost-history-salt-v1"), &self.signing_key.to_bytes());
+        let mut okm = Zeroizing::new([0u8; 32]);
+        hk.expand(b"ghost-history-key-v1", &mut *okm)
+            .expect("32-byte HKDF output is valid");
+        okm
+    }
+
     pub fn transport_probe_frame(&self, note: &str) -> Result<Vec<u8>, ProtocolError> {
         let mut message_id = MessageId([0; 16]);
         OsRng.fill_bytes(&mut message_id.0);
