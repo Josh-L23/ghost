@@ -13,9 +13,10 @@ What if you could talk to you'r computer science geeks through the terminal ? Sa
 - A versioned wire envelope with bounded validation rules, a passphrase-protected local identity, and a persistent peer trust store are defined in `ghost-core`.
 - Trust state is `UNVERIFIED`, `VERIFIED`, or `BLOCKED`; `/verify` requires the full fingerprint and survives restart.
 - The terminal shows a header, an activity timeline, a command line, and a status line.
-- Manual bounded TCP connections use Tokio in `ghost-network`; `/ping` exchanges a framed, signed control probe.
+- Manual bounded TCP connections use Tokio in `ghost-network`; connections are authenticated with signed hellos and ephemeral X25519 session keys.
+- `/ping` exchanges an encrypted session probe; unverified and blocked peers are refused before a session is established.
 - Recognized commands whose services do not exist yet report that they are not implemented.
-- Authenticated sessions, encrypted messaging, and message-history persistence are planned work, not features.
+- End-to-end messaging, receipts, and message-history persistence are planned work, not features.
 
 ## Run
 
