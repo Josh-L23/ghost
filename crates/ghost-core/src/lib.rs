@@ -4,6 +4,7 @@
 //! The wire envelope and its validation rules are defined in [`protocol`].
 
 pub mod command;
+pub mod delivery;
 pub mod event;
 pub mod identity;
 pub mod messaging;

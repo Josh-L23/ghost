@@ -15,6 +15,8 @@ use crate::{
 
 pub const MAX_TEXT_BYTES: usize = 4096;
 
+pub const RECEIPT_DELIVERED: u8 = 1;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PrivateMessage {
     pub message_id: MessageId,
@@ -22,6 +24,26 @@ pub struct PrivateMessage {
     pub recipient: IdentityId,
     pub created_at: u64,
     pub text: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Receipt {
+    pub message_id: MessageId,
+    pub acknowledged: MessageId,
+    pub sender: IdentityId,
+    pub recipient: IdentityId,
+    pub created_at: u64,
+    pub result: u8,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct ReceiptWireMessage {
+    message_id: MessageId,
+    acknowledged: MessageId,
+    sender: IdentityId,
+    recipient: IdentityId,
+    created_at: u64,
+    result: u8,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -172,6 +194,78 @@ pub fn open_frame(
     })
 }
 
+pub fn compose_receipt(
+    session: &mut session::EstablishedSession,
+    identity: &Identity,
+    acknowledged: MessageId,
+    now: u64,
+) -> Result<(Receipt, Vec<u8>), MessagingError> {
+    if acknowledged.is_zero() {
+        return Err(MessagingError::InvalidMessage("empty acknowledged id"));
+    }
+    let mut id = [0u8; 16];
+    OsRng.fill_bytes(&mut id);
+    let receipt = Receipt {
+        message_id: MessageId(id),
+        acknowledged,
+        sender: identity.identity_id(),
+        recipient: session.peer_id(),
+        created_at: now,
+        result: RECEIPT_DELIVERED,
+    };
+    let wire = ReceiptWireMessage {
+        message_id: receipt.message_id,
+        acknowledged: receipt.acknowledged,
+        sender: receipt.sender,
+        recipient: receipt.recipient,
+        created_at: receipt.created_at,
+        result: receipt.result,
+    };
+    let payload = to_allocvec(&wire)?;
+    let frame = session.encrypt_with_type(identity, &payload, now, MessageType::RECEIPT)?;
+    Ok((receipt, frame))
+}
+
+pub fn open_receipt(
+    session: &mut session::EstablishedSession,
+    frame: &[u8],
+    now: u64,
+) -> Result<Receipt, MessagingError> {
+    let decrypted = session.decrypt(frame, now)?;
+    open_receipt_frame(session, decrypted)
+}
+
+pub fn open_receipt_frame(
+    session: &session::EstablishedSession,
+    decrypted: DecryptedFrame,
+) -> Result<Receipt, MessagingError> {
+    if decrypted.message_type != MessageType::RECEIPT {
+        return Err(MessagingError::UnexpectedMessageType(
+            decrypted.message_type,
+        ));
+    }
+    let wire: ReceiptWireMessage = from_bytes(&decrypted.plaintext)?;
+    if wire.message_id.is_zero() || wire.acknowledged.is_zero() {
+        return Err(MessagingError::InvalidMessage("empty receipt identifier"));
+    }
+    if wire.sender != session.peer_id() || wire.recipient != session.local_id() {
+        return Err(MessagingError::InvalidMessage(
+            "receipt endpoints do not match the session",
+        ));
+    }
+    if wire.result != RECEIPT_DELIVERED {
+        return Err(MessagingError::InvalidMessage("unknown receipt result"));
+    }
+    Ok(Receipt {
+        message_id: wire.message_id,
+        acknowledged: wire.acknowledged,
+        sender: wire.sender,
+        recipient: wire.recipient,
+        created_at: wire.created_at,
+        result: wire.result,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -288,5 +382,40 @@ mod tests {
             .encrypt_with_type(&alice, b"just plaintext", now(), MessageType::PRIVATE)
             .unwrap();
         assert!(open(&mut bob_session, &frame, now()).is_err());
+    }
+
+    #[test]
+    fn valid_receipt_acknowledges_only_the_authenticated_message() {
+        let alice = identity("alice");
+        let bob = identity("bob");
+        let (mut alice_session, mut bob_session) = session_pair(&alice, &bob);
+        let (sent, frame) = compose(
+            &mut alice_session,
+            &alice,
+            bob.identity_id(),
+            "ack me",
+            now(),
+        )
+        .unwrap();
+        open(&mut bob_session, &frame, now()).unwrap();
+
+        let (_, receipt) = compose_receipt(&mut bob_session, &bob, sent.message_id, now()).unwrap();
+        let opened = open_receipt(&mut alice_session, &receipt, now()).unwrap();
+        assert_eq!(opened.acknowledged, sent.message_id);
+        assert_eq!(opened.sender, bob.identity_id());
+        assert_eq!(opened.result, RECEIPT_DELIVERED);
+    }
+
+    #[test]
+    fn receipt_from_unexpected_peer_is_rejected() {
+        let alice = identity("alice");
+        let bob = identity("bob");
+        let mallory = identity("mallory");
+        let (mut alice_session, _) = session_pair(&alice, &bob);
+        let (mut mallory_session, _) = session_pair(&mallory, &alice);
+
+        let (_, receipt) =
+            compose_receipt(&mut mallory_session, &mallory, MessageId([7; 16]), now()).unwrap();
+        assert!(open_receipt(&mut alice_session, &receipt, now()).is_err());
     }
 }

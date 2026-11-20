@@ -16,7 +16,7 @@ What if you could talk to you'r computer science geeks through the terminal ? Sa
 - Manual bounded TCP connections use Tokio in `ghost-network`; connections are authenticated with signed hellos and ephemeral X25519 session keys.
 - `/ping` exchanges an encrypted session probe; unverified and blocked peers are refused before a session is established.
 - `/msg <peer> <text>` sends content encrypted with a per-message key derived from the authenticated session; ciphertext is rejected before plaintext is rendered.
-- `/open <peer>` shows the in-memory conversation. Delivery receipts, persistence, groups, and relay services are still planned work.
+- `/open <peer>` shows the in-memory conversation with text delivery states. Valid signed receipts are the only way a message becomes acknowledged; persistence, groups, and relay services are still planned work.
 
 ## Run
 
