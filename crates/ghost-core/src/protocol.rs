@@ -156,6 +156,13 @@ pub enum Recipient {
 }
 
 impl Recipient {
+    pub fn peer_id(&self) -> Option<IdentityId> {
+        match self {
+            Self::Peer(id) => Some(*id),
+            Self::Group(_) => None,
+        }
+    }
+
     pub fn is_zero(&self) -> bool {
         match self {
             Self::Peer(id) => id.is_zero(),

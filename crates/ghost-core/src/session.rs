@@ -95,6 +95,10 @@ impl HelloBody {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DecryptedFrame {
+    pub message_id: MessageId,
+    pub sender: IdentityId,
+    pub recipient: IdentityId,
+    pub created_at: u64,
     pub message_type: MessageType,
     pub plaintext: Vec<u8>,
 }
@@ -337,6 +341,13 @@ impl EstablishedSession {
             .map_err(|_| SessionError::BadCiphertext)?;
         self.recv_sequence = self.recv_sequence.saturating_add(1);
         Ok(DecryptedFrame {
+            message_id: envelope.message_id,
+            sender: envelope.sender_identity,
+            recipient: match envelope.recipient {
+                Recipient::Peer(id) => id,
+                Recipient::Group(_) => return Err(SessionError::BadRecipient),
+            },
+            created_at: envelope.created_at,
             message_type: envelope.message_type,
             plaintext,
         })

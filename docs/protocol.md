@@ -1,6 +1,6 @@
 # GHOST v1 wire protocol and cryptographic design
 
-Status: proposed v1 design reviewed against the technical blueprint. It is not an external security audit and is not a production-security claim. `ghost-core` implements the envelope types, framing, validation rules, identity, trust records, authenticated ephemeral sessions, encrypted direct messages, and explicit delivery receipts; `ghost-network` implements bounded manual TCP transport. Deduplication, groups, relaying, and storage are tracked in separate issues.
+Status: proposed v1 design reviewed against the technical blueprint. It is not an external security audit and is not a production-security claim. `ghost-core` implements the envelope types, framing, validation rules, identity, trust records, authenticated ephemeral sessions, encrypted direct messages, explicit delivery receipts, and bounded replay protection; `ghost-network` implements bounded manual TCP transport. Groups, relaying, and storage are tracked in separate issues.
 
 Source: [technical blueprint](<PROJECT GHOST — Technical Specification and Implementation Blueprint.md>) sections 6, 7.4, 8, 9, 12, 13, 16, and 17.
 
@@ -101,6 +101,7 @@ Trust records are local state, never received from a peer as proof. A record sto
 | Expiry | `expires_at > now` |
 | Hops | `hop_count <= hop_limit <= 8` |
 | Identifiers and signature | Must be non-zero |
+| Deduplication state | At most 256 message ids; oldest entries evicted first |
 | Encoding | No trailing bytes, known types only, bounded length-prefixed data |
 
 Envelopes failing validation are rejected before they reach messaging, storage, or the UI. Error messages must not include plaintext payloads, keys, or authentication material.
