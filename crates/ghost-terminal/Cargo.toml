@@ -10,3 +10,4 @@ description = "Terminal-first Linux client for Project GHOST"
 ghost-core.workspace = true
 ratatui.workspace = true
 crossterm.workspace = true
+zeroize = "1"
