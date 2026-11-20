@@ -25,16 +25,22 @@ struct App {
     lines: Vec<String>,
     should_quit: bool,
     identity_label: String,
+    fingerprint_short: String,
+    fingerprint_full: String,
 }
 
 impl App {
-    fn new(username: &str) -> Self {
+    fn new(identity: &Identity) -> Self {
+        let fingerprint = identity.fingerprint();
         let mut app = Self {
-            identity_label: username.to_owned(),
+            identity_label: identity.username().to_owned(),
+            fingerprint_short: fingerprint.short(),
+            fingerprint_full: fingerprint.full(),
             ..Self::default()
         };
         app.lines.push(format!(
-            "Welcome, {username}. Your local identity is ready."
+            "Welcome, {}. Your local identity is ready.",
+            identity.username()
         ));
         app.lines
             .push("Type /help for available commands. Use /quit or Ctrl-C to exit.".into());
@@ -53,8 +59,19 @@ impl App {
                 "          /disconnect <peer> /msg <peer> <text> /open <peer>".into(),
                 "          /history [peer|group] /relay status|enable|disable".into(),
                 "          /clear /quit".into(),
-                "Network, identity, storage, and relay services are not implemented yet.".into(),
+                "/whoami shows your username and identity fingerprint.".into(),
+                "Network, storage, and relay services are not implemented yet.".into(),
             ]),
+            Ok(Command::WhoAmI) => {
+                self.lines
+                    .push(format!("Username: {}", self.identity_label));
+                self.lines
+                    .push(format!("Fingerprint: {}", self.fingerprint_short));
+                self.lines
+                    .push(format!("Full:        {}", self.fingerprint_full));
+                self.lines
+                    .push("Compare the fingerprint out-of-band before trusting a peer.".into());
+            }
             Ok(Command::Clear) => self.lines.clear(),
             Ok(Command::Quit) => self.should_quit = true,
             Ok(_) => self
@@ -82,7 +99,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
 fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<(), Box<dyn Error>> {
     let identity = setup_identity(terminal)?;
-    let mut app = App::new(identity.username());
+    let mut app = App::new(&identity);
 
     while !app.should_quit {
         terminal.draw(|frame| draw(frame, &app))?;
