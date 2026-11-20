@@ -93,6 +93,12 @@ impl HelloBody {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DecryptedFrame {
+    pub message_type: MessageType,
+    pub plaintext: Vec<u8>,
+}
+
 #[derive(Serialize)]
 struct SignedHello<'a> {
     version: u16,
@@ -239,6 +245,16 @@ impl EstablishedSession {
         plaintext: &[u8],
         now: u64,
     ) -> Result<Vec<u8>, SessionError> {
+        self.encrypt_with_type(identity, plaintext, now, MessageType::CONTROL)
+    }
+
+    pub fn encrypt_with_type(
+        &mut self,
+        identity: &Identity,
+        plaintext: &[u8],
+        now: u64,
+        message_type: MessageType,
+    ) -> Result<Vec<u8>, SessionError> {
         if plaintext.is_empty() || plaintext.len() > MAX_SESSION_PLAINTEXT {
             return Err(SessionError::PayloadTooLarge);
         }
@@ -268,7 +284,7 @@ impl EstablishedSession {
             message_id: MessageId(message_id),
             sender_identity: self.local_id,
             recipient: Recipient::Peer(self.peer_id),
-            message_type: MessageType::CONTROL,
+            message_type,
             created_at: now,
             expires_at: now.saturating_add(60),
             routing: RoutingMetadata {
@@ -282,10 +298,9 @@ impl EstablishedSession {
         encode_frame(&envelope).map_err(Into::into)
     }
 
-    pub fn decrypt(&mut self, frame: &[u8], now: u64) -> Result<Vec<u8>, SessionError> {
+    pub fn decrypt(&mut self, frame: &[u8], now: u64) -> Result<DecryptedFrame, SessionError> {
         let envelope = decode_frame(frame, now)?;
-        if envelope.message_type != MessageType::CONTROL
-            || envelope.sender_identity != self.peer_id
+        if envelope.sender_identity != self.peer_id
             || envelope.recipient != Recipient::Peer(self.local_id)
         {
             return Err(SessionError::BadRecipient);
@@ -317,7 +332,94 @@ impl EstablishedSession {
             )
             .map_err(|_| SessionError::BadCiphertext)?;
         self.recv_sequence = self.recv_sequence.saturating_add(1);
-        Ok(plaintext)
+        Ok(DecryptedFrame {
+            message_type: envelope.message_type,
+            plaintext,
+        })
+    }
+
+    pub fn encrypt_content(
+        &self,
+        plaintext: &[u8],
+        message_id: &MessageId,
+        recipient: IdentityId,
+    ) -> Result<([u8; NONCE_LEN], Vec<u8>), SessionError> {
+        if plaintext.is_empty() || plaintext.len() > MAX_SESSION_PLAINTEXT {
+            return Err(SessionError::PayloadTooLarge);
+        }
+        let key = self.message_key(message_id, self.local_id, recipient)?;
+        let aad = self.content_aad(message_id, self.local_id, recipient);
+        let mut nonce = [0u8; NONCE_LEN];
+        OsRng.fill_bytes(&mut nonce);
+        let cipher =
+            ChaCha20Poly1305::new_from_slice(&key[..]).map_err(|_| SessionError::KeyDerivation)?;
+        let ciphertext = cipher
+            .encrypt(
+                Nonce::from_slice(&nonce),
+                Payload {
+                    msg: plaintext,
+                    aad: &aad,
+                },
+            )
+            .map_err(|_| SessionError::BadCiphertext)?;
+        Ok((nonce, ciphertext))
+    }
+
+    pub fn decrypt_content(
+        &self,
+        nonce: &[u8; NONCE_LEN],
+        ciphertext: &[u8],
+        message_id: &MessageId,
+        sender: IdentityId,
+    ) -> Result<Vec<u8>, SessionError> {
+        let key = self.message_key(message_id, sender, self.local_id)?;
+        let aad = self.content_aad(message_id, sender, self.local_id);
+        let cipher =
+            ChaCha20Poly1305::new_from_slice(&key[..]).map_err(|_| SessionError::KeyDerivation)?;
+        cipher
+            .decrypt(
+                Nonce::from_slice(nonce),
+                Payload {
+                    msg: ciphertext,
+                    aad: &aad,
+                },
+            )
+            .map_err(|_| SessionError::BadCiphertext)
+    }
+
+    fn message_key(
+        &self,
+        message_id: &MessageId,
+        first: IdentityId,
+        second: IdentityId,
+    ) -> Result<Zeroizing<[u8; 32]>, SessionError> {
+        let mut parties = [first.0, second.0];
+        parties.sort();
+        let hkdf = Hkdf::<Sha256>::new(Some(&self.session_id), &self.key[..]);
+        let mut info = b"ghost-v1-message".to_vec();
+        info.extend_from_slice(&message_id.0);
+        for party in parties {
+            info.extend_from_slice(&party);
+        }
+        let mut key = [0u8; 32];
+        hkdf.expand(&info, &mut key)
+            .map_err(|_| SessionError::KeyDerivation)?;
+        Ok(Zeroizing::new(key))
+    }
+
+    fn content_aad(
+        &self,
+        message_id: &MessageId,
+        sender: IdentityId,
+        recipient: IdentityId,
+    ) -> Vec<u8> {
+        let mut aad = Vec::with_capacity(16 + 32 + 16 + 32 + 32);
+        aad.extend_from_slice(&self.session_id);
+        aad.extend_from_slice(&self.transcript);
+        aad.extend_from_slice(&message_id.0);
+        aad.extend_from_slice(&sender.0);
+        aad.extend_from_slice(&recipient.0);
+        aad
     }
 
     fn aad(&self, sequence: u64, sender: IdentityId, recipient: IdentityId) -> Vec<u8> {
@@ -480,11 +582,14 @@ mod tests {
         assert_eq!(bob_session.peer_id(), alice.identity_id());
 
         let frame = alice_session.encrypt(&alice, b"hello bob", now()).unwrap();
-        assert_eq!(bob_session.decrypt(&frame, now()).unwrap(), b"hello bob");
+        assert_eq!(
+            bob_session.decrypt(&frame, now()).unwrap().plaintext,
+            b"hello bob"
+        );
 
         let reply = bob_session.encrypt(&bob, b"hello alice", now()).unwrap();
         assert_eq!(
-            alice_session.decrypt(&reply, now()).unwrap(),
+            alice_session.decrypt(&reply, now()).unwrap().plaintext,
             b"hello alice"
         );
     }

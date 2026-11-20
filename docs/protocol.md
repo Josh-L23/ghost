@@ -1,6 +1,6 @@
 # GHOST v1 wire protocol and cryptographic design
 
-Status: proposed v1 design reviewed against the technical blueprint. It is not an external security audit and is not a production-security claim. `ghost-core` implements the envelope types, framing, validation rules, identity, trust records, and authenticated ephemeral sessions; `ghost-network` implements bounded manual TCP transport. End-to-end message cryptography, receipts, and storage are tracked in separate issues.
+Status: proposed v1 design reviewed against the technical blueprint. It is not an external security audit and is not a production-security claim. `ghost-core` implements the envelope types, framing, validation rules, identity, trust records, authenticated ephemeral sessions, and encrypted direct messages; `ghost-network` implements bounded manual TCP transport. Receipts, deduplication, groups, relaying, and storage are tracked in separate issues.
 
 Source: [technical blueprint](<PROJECT GHOST — Technical Specification and Implementation Blueprint.md>) sections 6, 7.4, 8, 9, 12, 13, 16, and 17.
 
@@ -62,7 +62,7 @@ Canonical authenticated bytes are the exact serialized envelope prefix before `a
 nonce[12] || ciphertext || tag[16]
 ```
 
-The nonce is 96 bits of randomness from the OS CSPRNG and must never repeat under the same key. The tag is the AEAD authentication tag. A `RECEIPT` encrypts the acknowledged `message_id` and delivery result inside this payload. Relays forward the ciphertext without receiving the decryption key.
+The nonce is 96 bits of randomness from the OS CSPRNG and must never repeat under the same key. The tag is the AEAD authentication tag. For `PRIVATE` messages, the inner plaintext is a postcard `PrivateWireMessage` containing the message id, sender, recipient, timestamp, inner nonce, and ciphertext. The text ciphertext uses a per-message ChaCha20-Poly1305 key derived with HKDF-SHA256 from the session key, message id, and both identities in sorted order; its AAD binds the session transcript, message id, sender, and recipient. The resulting wire payload is then encrypted again under the session key and signed in the envelope. A `RECEIPT` encrypts the acknowledged `message_id` and delivery result inside this payload. Relays forward the ciphertext without receiving either decryption key.
 
 ## Version negotiation and session establishment
 
