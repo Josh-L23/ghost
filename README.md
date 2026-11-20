@@ -17,7 +17,9 @@ What if you could talk to you'r computer science geeks through the terminal ? Sa
 - `/ping` exchanges an encrypted session probe; unverified and blocked peers are refused before a session is established.
 - `/msg <peer> <text>` sends content encrypted with a per-message key derived from the authenticated session; ciphertext is rejected before plaintext is rendered.
 - `/open <peer>` shows the in-memory conversation with text delivery states. Valid signed receipts are the only way a message becomes acknowledged.
-- A bounded replay cache suppresses duplicate or expired frames before they reach the timeline. Persistence, groups, relay services, and Bluetooth are still planned work.
+- A bounded replay cache suppresses duplicate or expired frames before they reach the timeline.
+- An automated multi-peer TCP test covers connection, authentication, encrypted delivery, receipts, and replay rejection; CI runs formatting, linting, and tests.
+- Persistence, groups, relay services, and Bluetooth are still planned work.
 
 ## Run
 

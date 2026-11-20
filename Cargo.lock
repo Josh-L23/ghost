@@ -673,6 +673,7 @@ name = "ghost-network"
 version = "0.1.0"
 dependencies = [
  "ghost-core",
+ "tempfile",
  "tokio",
 ]
 
