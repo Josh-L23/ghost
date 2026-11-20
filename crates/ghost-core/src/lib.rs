@@ -11,4 +11,5 @@ pub mod identity;
 pub mod messaging;
 pub mod protocol;
 pub mod session;
+pub mod storage;
 pub mod trust;
