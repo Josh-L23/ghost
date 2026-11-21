@@ -8,6 +8,7 @@ description = "Bounded transport adapters for Project GHOST"
 
 [dependencies]
 ghost-core.workspace = true
+mdns-sd = "0.22"
 tokio.workspace = true
 
 [dev-dependencies]

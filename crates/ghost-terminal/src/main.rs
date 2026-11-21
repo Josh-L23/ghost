@@ -21,7 +21,10 @@ use ghost_core::{
     session::{self, EstablishedSession, PendingSession},
     trust::{self, TrustRecord, TrustStore},
 };
-use ghost_network::{ConnectionState, TransportCommand, TransportEvent, TransportHandle};
+use ghost_network::{
+    ConnectionState, TransportCommand, TransportEvent, TransportHandle,
+    discovery::{DiscoveredPeer, DiscoveryEvent, DiscoveryHandle, MAX_DISCOVERED_PEERS},
+};
 use ratatui::{
     Terminal,
     backend::CrosstermBackend,
@@ -44,6 +47,8 @@ struct App {
     trust: TrustStore,
     identity: Identity,
     transport: TransportHandle,
+    discovery: DiscoveryHandle,
+    discovered: Vec<DiscoveredPeer>,
     connections: Vec<(SocketAddr, ConnectionState)>,
     listen_addr: Option<SocketAddr>,
     handshakes: HashMap<SocketAddr, PendingSession>,
@@ -54,7 +59,12 @@ struct App {
 }
 
 impl App {
-    fn new(identity: Identity, trust: TrustStore, transport: TransportHandle) -> Self {
+    fn new(
+        identity: Identity,
+        trust: TrustStore,
+        transport: TransportHandle,
+        discovery: DiscoveryHandle,
+    ) -> Self {
         let fingerprint = identity.fingerprint();
         let username = identity.username().to_owned();
         let mut app = Self {
@@ -67,6 +77,8 @@ impl App {
             trust,
             identity,
             transport,
+            discovery,
+            discovered: Vec::new(),
             connections: Vec::new(),
             listen_addr: None,
             handshakes: HashMap::new(),
@@ -80,6 +92,10 @@ impl App {
         ));
         app.lines.push(
             "Unverified peers are never trusted automatically; compare fingerprints out-of-band."
+                .into(),
+        );
+        app.lines.push(
+            "Local discovery is optional: /scan lists candidates; connect and verify manually."
                 .into(),
         );
         app.lines
@@ -103,6 +119,8 @@ impl App {
                 "/whoami shows your username and identity fingerprint.".into(),
                 "Peers may be selected by label, short fingerprint, or full fingerprint.".into(),
                 "TCP is manual-only; sessions require verified peer fingerprints.".into(),
+                "/scan is optional; mDNS may be blocked, so /connect <ip:port> always works.".into(),
+                "Discovered peers are never trusted or contacted without your approval.".into(),
                 "Delivery indicators are text; a transport write is not a receipt.".into(),
                 "Message history is in-memory only; storage and relay services are not implemented yet.".into(),
             ]),
@@ -148,6 +166,20 @@ impl App {
                         self.lines.push(describe_record(record));
                     }
                 }
+                let discovered: Vec<String> = self
+                    .discovered
+                    .iter()
+                    .map(|peer| describe_discovered(peer, &self.discovered_trust_state(&peer.label)))
+                    .collect();
+                if discovered.is_empty() {
+                    self.lines.push(
+                        "Discovered: none. Use /scan; manual /connect still works.".into(),
+                    );
+                } else {
+                    self.lines
+                        .push(format!("Discovered candidates ({}):", discovered.len()));
+                    self.lines.extend(discovered);
+                }
             }
             Ok(Command::Verify { peer, fingerprint }) => {
                 match self.trust.verify(&peer, &fingerprint, now()) {
@@ -175,8 +207,14 @@ impl App {
                 )),
                 Err(error) => self.lines.push(format!("Unblock failed: {error}")),
             },
+            Ok(Command::Scan) => {
+                self.discovery.scan();
+                self.lines
+                    .push("[SCAN] Local discovery requested; results appear below.".into());
+            }
             Ok(Command::Listen(address)) => {
                 self.send_command(TransportCommand::Listen(address));
+                self.discovery.advertise(address.port());
                 self.lines
                     .push(format!("Requesting listener on {address}."));
             }
@@ -296,13 +334,19 @@ impl App {
     }
 
     fn drain_events(&mut self) {
+        self.drain_discovery_events();
         while let Some(event) = self.transport.try_event() {
             match event {
                 TransportEvent::Listening(address) => {
                     self.listen_addr = Some(address);
+                    self.discovery.advertise(address.port());
                     self.lines.push(format!(
                         "[LISTENING] Accepting manual connections on {address}."
                     ));
+                    self.lines.push(
+                        "[DISCOVERY] Announcing this node on the local network; manual connection remains available."
+                            .into(),
+                    );
                 }
                 TransportEvent::Incoming(peer) => {
                     self.set_connection_state(peer, ConnectionState::Connected);
@@ -326,6 +370,68 @@ impl App {
                     self.lines.push(format!("[NETWORK] {peer} {message}"));
                 }
             }
+        }
+    }
+
+    fn drain_discovery_events(&mut self) {
+        while let Some(event) = self.discovery.try_event() {
+            match event {
+                DiscoveryEvent::Found(peer) => {
+                    self.insert_discovered(peer.clone());
+                    self.lines.push(format!(
+                        "[DISCOVERY] Found {} at {} (unverified). Use /connect {} and compare fingerprints.",
+                        peer.label, peer.addr, peer.addr
+                    ));
+                }
+                DiscoveryEvent::Gone(addr) | DiscoveryEvent::Expired(addr) => {
+                    self.discovered.retain(|peer| peer.addr != addr);
+                }
+                DiscoveryEvent::ScanComplete(peers) => {
+                    self.discovered = peers;
+                    if self.discovered.is_empty() {
+                        self.lines.push(
+                            "[SCAN] No peers found. mDNS may be blocked; use /connect <ip:port>."
+                                .into(),
+                        );
+                    } else {
+                        let descriptions: Vec<String> = self
+                            .discovered
+                            .iter()
+                            .map(|peer| {
+                                describe_discovered(peer, &self.discovered_trust_state(&peer.label))
+                            })
+                            .collect();
+                        self.lines.push(format!(
+                            "[SCAN] {} discovered candidate(s):",
+                            self.discovered.len()
+                        ));
+                        self.lines.extend(descriptions);
+                    }
+                }
+                DiscoveryEvent::Error(message) => self.lines.push(format!("[DISCOVERY] {message}")),
+            }
+        }
+    }
+
+    fn insert_discovered(&mut self, peer: DiscoveredPeer) {
+        if self.discovered.iter().any(|found| found.addr == peer.addr) {
+            return;
+        }
+        self.discovered.push(peer);
+        if self.discovered.len() > MAX_DISCOVERED_PEERS {
+            self.discovered.remove(0);
+        }
+    }
+
+    fn discovered_trust_state(&self, label: &str) -> String {
+        match self
+            .trust
+            .records()
+            .iter()
+            .find(|record| record.label() == label)
+        {
+            Some(record) => format!("{} ({})", record.state.label(), record.short_fingerprint()),
+            None => "unknown / unverified".into(),
         }
     }
 
@@ -595,6 +701,13 @@ fn describe_record(record: &TrustRecord) -> String {
     )
 }
 
+fn describe_discovered(peer: &DiscoveredPeer, trust_state: &str) -> String {
+    format!(
+        "  {} at {} — trust: {trust_state}; connect manually and verify fingerprint",
+        peer.label, peer.addr
+    )
+}
+
 fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -624,8 +737,10 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<(), Box<
         .enable_all()
         .build()?;
     let _guard = runtime.enter();
+    let discovery_label = identity.username().to_owned();
     let transport = ghost_network::start(ghost_network::default_listen_addr())?;
-    let mut app = App::new(identity, trust, transport);
+    let discovery = ghost_network::discovery::start(discovery_label);
+    let mut app = App::new(identity, trust, transport, discovery);
 
     while !app.should_quit {
         app.drain_events();
@@ -652,6 +767,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<(), Box<
             }
         }
     }
+    app.discovery.shutdown();
     app.transport.shutdown();
     Ok(())
 }
@@ -711,13 +827,14 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
         .count();
     frame.render_widget(
         Paragraph::new(format!(
-            "Identity: {} ({})  |  Links: {} ({} sessions)  |  Peers: {} ({} verified)  |  Ctrl-C: quit",
+            "Identity: {} ({})  |  Links: {} ({} sessions)  |  Known: {} ({} verified)  |  Discovered: {}  |  Ctrl-C: quit",
             app.identity_label,
             app.fingerprint_short,
             connected,
             app.sessions.len(),
             app.trust.records().len(),
-            verified
+            verified,
+            app.discovered.len()
         )),
         areas[3],
     );
@@ -891,5 +1008,18 @@ mod tests {
         let description = describe_record(&record);
         assert!(description.contains("[UNVERIFIED]"));
         assert!(description.contains("verify before trusting"));
+    }
+
+    #[test]
+    fn discovered_peer_description_shows_trust_state() {
+        let peer = DiscoveredPeer::new(
+            "192.168.1.20:9000".parse().unwrap(),
+            "ada".into(),
+            std::time::Instant::now(),
+        );
+        let description = describe_discovered(&peer, "verified (a1b2)");
+        assert!(description.contains("ada at 192.168.1.20:9000"));
+        assert!(description.contains("verified (a1b2)"));
+        assert!(description.contains("verify fingerprint"));
     }
 }
