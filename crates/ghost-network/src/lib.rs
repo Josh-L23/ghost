@@ -1,5 +1,7 @@
 //! Bounded, transport-neutral connection adapters.
 
+pub mod discovery;
+
 use ghost_core::protocol::{FRAME_HEADER_LEN, MAX_ENVELOPE_BYTES};
 use std::{collections::HashMap, fmt, net::SocketAddr, sync::Arc, time::Duration};
 use tokio::{
