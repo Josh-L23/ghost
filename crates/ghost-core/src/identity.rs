@@ -244,6 +244,46 @@ impl IdentityStore {
         }
     }
 
+    pub fn export(&self, dest: impl AsRef<Path>) -> Result<(), IdentityError> {
+        let bytes = fs::read(&self.path)?;
+        Self::parse_stored(&bytes)?;
+        let dest = dest.as_ref();
+        if dest.exists() {
+            return Err(IdentityError::AlreadyExists);
+        }
+        write_new_file(dest, &bytes)?;
+        Ok(())
+    }
+
+    pub fn import(&self, src: impl AsRef<Path>) -> Result<(), IdentityError> {
+        if self.exists() {
+            return Err(IdentityError::AlreadyExists);
+        }
+        let bytes = fs::read(src.as_ref())?;
+        Self::parse_stored(&bytes)?;
+        write_new_file(&self.path, &bytes)?;
+        Ok(())
+    }
+
+    fn parse_stored(bytes: &[u8]) -> Result<StoredIdentity, IdentityError> {
+        if bytes.is_empty() || bytes.len() > MAX_FILE_BYTES {
+            return Err(IdentityError::Corrupt);
+        }
+        let (stored, remainder) = postcard::take_from_bytes::<StoredIdentity>(bytes)?;
+        if !remainder.is_empty() || &stored.magic != MAGIC {
+            return Err(IdentityError::Corrupt);
+        }
+        if stored.version != VERSION {
+            return Err(IdentityError::UnsupportedVersion(stored.version));
+        }
+        let username = String::from_utf8(stored.username.as_slice().to_vec())
+            .map_err(|_| IdentityError::Corrupt)?;
+        if !is_valid_username(&username) {
+            return Err(IdentityError::Corrupt);
+        }
+        Ok(stored)
+    }
+
     pub fn create(&self, username: &str, passphrase: &[u8]) -> Result<Identity, IdentityError> {
         validate_username(username)?;
         validate_passphrase(passphrase)?;
@@ -296,23 +336,10 @@ impl IdentityStore {
         validate_passphrase(passphrase)?;
         check_permissions(&self.path)?;
         let bytes = fs::read(&self.path)?;
-        if bytes.is_empty() || bytes.len() > MAX_FILE_BYTES {
-            return Err(IdentityError::Corrupt);
-        }
-
-        let (stored, remainder) = postcard::take_from_bytes::<StoredIdentity>(&bytes)?;
-        if !remainder.is_empty() || &stored.magic != MAGIC {
-            return Err(IdentityError::Corrupt);
-        }
-        if stored.version != VERSION {
-            return Err(IdentityError::UnsupportedVersion(stored.version));
-        }
+        let stored = Self::parse_stored(&bytes)?;
 
         let username = String::from_utf8(stored.username.as_slice().to_vec())
             .map_err(|_| IdentityError::Corrupt)?;
-        if !is_valid_username(&username) {
-            return Err(IdentityError::Corrupt);
-        }
 
         let derived_key = derive_key(passphrase, &stored.salt, &self.params)?;
         let cipher =
@@ -675,6 +702,80 @@ mod tests {
         assert_eq!(envelope.sender_identity, identity.identity_id());
         assert_eq!(envelope.message_type, MessageType::CONTROL);
         assert!(!envelope.authentication_data.is_zero());
+    }
+
+    #[test]
+    fn export_import_round_trip_preserves_identity() {
+        let dir = tempdir().unwrap();
+        let store = IdentityStore::new(dir.path().join("identity.ghost"));
+        let created = store.create("ada", passphrase()).unwrap();
+        let backup = dir.path().join("backup.ghost");
+        store.export(&backup).unwrap();
+
+        let original = fs::read(dir.path().join("identity.ghost")).unwrap();
+        let exported = fs::read(&backup).unwrap();
+        assert_eq!(original, exported);
+        let secret = created.signing_key.to_bytes();
+        assert!(!exported.windows(secret.len()).any(|w| w == secret));
+        assert!(!String::from_utf8_lossy(&exported).contains("correct horse"));
+
+        let restored_store = IdentityStore::new(dir.path().join("restored.ghost"));
+        restored_store.import(&backup).unwrap();
+        let restored = restored_store.load(passphrase()).unwrap();
+        assert_eq!(restored.username(), "ada");
+        assert_eq!(restored.identity_id(), created.identity_id());
+        assert_eq!(restored.fingerprint(), created.fingerprint());
+        assert!(matches!(
+            restored_store.load(b"not the right passphrase"),
+            Err(IdentityError::WrongPassphrase)
+        ));
+        let restored_bytes = fs::read(dir.path().join("restored.ghost")).unwrap();
+        assert!(!restored_bytes.windows(secret.len()).any(|w| w == secret));
+    }
+
+    #[test]
+    fn export_and_import_refuse_overwrite_and_reject_invalid_blob() {
+        let dir = tempdir().unwrap();
+        let store = IdentityStore::new(dir.path().join("identity.ghost"));
+        store.create("ada", passphrase()).unwrap();
+        let backup = dir.path().join("backup.ghost");
+        store.export(&backup).unwrap();
+        assert!(matches!(
+            store.export(&backup),
+            Err(IdentityError::AlreadyExists)
+        ));
+
+        let other = IdentityStore::new(dir.path().join("other.ghost"));
+        other.create("grace", passphrase()).unwrap();
+        assert!(matches!(
+            other.import(&backup),
+            Err(IdentityError::AlreadyExists)
+        ));
+
+        let empty = IdentityStore::new(dir.path().join("new.ghost"));
+        let corrupt = dir.path().join("corrupt.ghost");
+        fs::write(&corrupt, b"not a ghost identity").unwrap();
+        assert!(matches!(
+            empty.import(&corrupt),
+            Err(IdentityError::Encoding(_)) | Err(IdentityError::Corrupt)
+        ));
+        assert!(!empty.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exported_identity_has_restrictive_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let store = IdentityStore::new(dir.path().join("identity.ghost"));
+        store.create("ada", passphrase()).unwrap();
+        let backup = dir.path().join("backup.ghost");
+        store.export(&backup).unwrap();
+        assert_eq!(
+            fs::metadata(&backup).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 
     fn now_for_test() -> u64 {

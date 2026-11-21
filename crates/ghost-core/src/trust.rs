@@ -550,4 +550,39 @@ mod tests {
             Err(TrustError::InsecurePermissions)
         ));
     }
+
+    #[test]
+    fn lost_device_replacement_requires_reverification_and_old_can_be_revoked() {
+        let dir = tempdir().unwrap();
+        let mut store = TrustStore::load_or_empty(dir.path().join("trust.ghost")).unwrap();
+        let old = identity(20);
+        let replacement = identity(21);
+        store.observe(old, "ada", 100).unwrap();
+        store
+            .verify(&fingerprint(&old), &fingerprint(&old), 101)
+            .unwrap();
+        assert_eq!(store.state_of(&old), TrustState::Verified);
+
+        store.block(&fingerprint(&old), 102).unwrap();
+        assert_eq!(store.state_of(&old), TrustState::Blocked);
+
+        let outcome = store.observe(replacement, "ada", 103).unwrap();
+        assert_eq!(
+            outcome,
+            ObserveOutcome::KeyChange {
+                previous_fingerprint: fingerprint(&old)
+            }
+        );
+        assert_eq!(store.state_of(&replacement), TrustState::Unverified);
+        assert!(!store.is_verified(&replacement));
+
+        let replacement_selector = fingerprint(&replacement);
+        assert!(
+            store
+                .verify(&replacement_selector, &replacement_selector, 104)
+                .is_ok()
+        );
+        assert_eq!(store.state_of(&replacement), TrustState::Verified);
+        assert_eq!(store.state_of(&old), TrustState::Blocked);
+    }
 }
