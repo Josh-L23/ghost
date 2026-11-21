@@ -59,6 +59,7 @@ docs/
 - [Technical specification and implementation blueprint](<docs/PROJECT GHOST — Technical Specification and Implementation Blueprint.md>) — the source document for product scope, architecture, threat model, development stages, risks, and release criteria.
 - [Architecture and implementation sequence](docs/architecture.md) — crate boundaries and the short staged plan.
 - [Wire protocol and cryptographic design](docs/protocol.md) — envelope, framing, validation limits, threat model, and conservative security claims.
+- [Identity backup and recovery](docs/recovery.md) — encrypted export/import, device loss and revocation/replacement, and key-rotation limitations.
 - [Tracked issues](https://github.com/Josh-L23/ghost/issues) — actionable work grouped by area with acceptance criteria and dependencies.
 
 ## Development direction
