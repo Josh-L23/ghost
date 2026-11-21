@@ -110,7 +110,7 @@ Envelopes failing validation are rejected before they reach messaging, storage, 
 
 ## Transport limits
 
-The first adapter is manual TCP over a bounded command/event interface. The UI never auto-connects; `/listen`, `/connect`, and `/disconnect` are explicit user actions.
+The first adapter is manual TCP over a bounded command/event interface. The UI never auto-connects to discovered peers; `/listen`, `/connect`, and `/disconnect` are explicit user actions. After an explicit `/connect`, bounded retries may re-establish that same target until `/disconnect` cancels it.
 
 | Limit | Value |
 | --- | --- |

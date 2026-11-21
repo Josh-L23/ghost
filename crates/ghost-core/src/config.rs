@@ -2,13 +2,12 @@
 
 use serde::{Deserialize, Serialize};
 use std::{
-    fmt, fs,
-    io::Write,
+    fmt,
     net::SocketAddr,
     path::{Path, PathBuf},
 };
 
-use crate::{identity, protocol::read_bounded};
+use crate::{fsutil, identity, protocol::read_bounded};
 
 const MAX_FILE_BYTES: usize = 16 * 1024;
 pub const MAX_CONNECTIONS_CEILING: usize = 8;
@@ -132,31 +131,27 @@ impl Config {
         Ok(config)
     }
 
+    pub fn load_or_safe_default(
+        path: impl AsRef<Path>,
+    ) -> Result<(Self, Option<PathBuf>), ConfigError> {
+        let path = path.as_ref();
+        match Self::load_or_create(path) {
+            Ok(config) => Ok((config, None)),
+            Err(error) => {
+                let quarantined = fsutil::quarantine(path, &error.to_string())?;
+                let fallback = Self::default();
+                fallback.save(path)?;
+                Ok((fallback, Some(quarantined)))
+            }
+        }
+    }
+
     pub fn save(&self, path: impl AsRef<Path>) -> Result<(), ConfigError> {
         self.validate()?;
         let path = path.as_ref();
-        if let Some(parent) = path.parent() {
-            let mut builder = fs::DirBuilder::new();
-            builder.recursive(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::DirBuilderExt;
-                builder.mode(0o700);
-            }
-            builder.create(parent)?;
-        }
         let text = toml::to_string_pretty(self)
             .map_err(|error| ConfigError::Invalid(error.to_string()))?;
-        let mut options = fs::OpenOptions::new();
-        options.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = options.open(path)?;
-        file.write_all(text.as_bytes())?;
-        file.sync_all()?;
+        fsutil::atomic_write(path, text.as_bytes(), 0o600, true)?;
         Ok(())
     }
 }
@@ -215,6 +210,7 @@ pub fn default_config_path() -> Result<PathBuf, ConfigError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use tempfile::tempdir;
 
     #[test]
@@ -252,6 +248,20 @@ mod tests {
         let error = Config::load(&path).unwrap_err();
         assert!(matches!(error, ConfigError::Parse(_)));
         assert!(error.to_string().contains("malformed"));
+    }
+
+    #[test]
+    fn corrupt_config_is_quarantined_and_defaults_are_restored() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "username = [not valid").unwrap();
+
+        let (config, quarantined) = Config::load_or_safe_default(&path).unwrap();
+        assert_eq!(config, Config::default());
+        let quarantined = quarantined.expect("expected quarantine path");
+        assert!(quarantined.exists());
+        assert!(quarantined.to_string_lossy().contains("corrupt"));
+        assert_eq!(Config::load(&path).unwrap(), Config::default());
     }
 
     #[test]

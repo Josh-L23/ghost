@@ -14,6 +14,7 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use crate::{
     dedup,
     delivery::DeliveryState,
+    fsutil,
     history::{self, EncryptedHistoryRecord},
     identity,
     protocol::{IdentityId, MessageId, MessageType},
@@ -118,6 +119,26 @@ impl Storage {
         let mut storage = Self { conn };
         storage.initialize()?;
         Ok(storage)
+    }
+
+    pub fn open_or_quarantined(
+        path: impl AsRef<Path>,
+    ) -> Result<(Self, Option<PathBuf>), StorageError> {
+        let path = path.as_ref();
+        match Self::open(path) {
+            Ok(storage) => Ok((storage, None)),
+            Err(error) => {
+                let quarantined = fsutil::quarantine(path, &error.to_string())?;
+                for suffix in ["-wal", "-shm"] {
+                    let sidecar = PathBuf::from(format!("{}{suffix}", path.to_string_lossy()));
+                    if sidecar.exists() {
+                        fsutil::quarantine(&sidecar, &error.to_string())?;
+                    }
+                }
+                let storage = Self::open(path)?;
+                Ok((storage, Some(quarantined)))
+            }
+        }
     }
 
     pub fn open_in_memory() -> Result<Self, StorageError> {
@@ -905,6 +926,20 @@ mod tests {
         if let Err(err) = Storage::open(&path) {
             let _ = err.to_string();
         }
+    }
+
+    #[test]
+    fn corrupt_database_is_quarantined_and_recreated() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("ghost.db");
+        fs::write(&path, b"not a sqlite database").unwrap();
+
+        let (storage, quarantined) = Storage::open_or_quarantined(&path).unwrap();
+        drop(storage);
+        let quarantined = quarantined.expect("expected quarantine path");
+        assert!(quarantined.exists());
+        assert_eq!(fs::read(&quarantined).unwrap(), b"not a sqlite database");
+        assert!(Storage::open(&path).is_ok());
     }
 
     #[test]

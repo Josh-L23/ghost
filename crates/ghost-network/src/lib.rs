@@ -8,6 +8,7 @@ use std::{
     fmt,
     net::SocketAddr,
     sync::Arc,
+    thread,
     time::{Duration, Instant},
 };
 use tokio::{
@@ -19,6 +20,7 @@ use tokio::{
     sync::{
         Mutex, OwnedSemaphorePermit, Semaphore,
         mpsc::{self, error::TrySendError},
+        oneshot,
     },
     task::JoinHandle,
     time::timeout,
@@ -111,6 +113,7 @@ impl From<TrySendError<TransportCommand>> for NetworkError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnectionState {
     Connecting,
+    Reconnecting(u32),
     Connected,
     Disconnected,
 }
@@ -129,6 +132,7 @@ pub enum TransportEvent {
     Listening(SocketAddr),
     Incoming(SocketAddr),
     Connected(SocketAddr),
+    ConnectFailed(SocketAddr, String),
     Disconnected(SocketAddr, String),
     Frame {
         peer: SocketAddr,
@@ -144,6 +148,7 @@ pub struct TransportHandle {
     commands: mpsc::Sender<TransportCommand>,
     events: mpsc::Receiver<TransportEvent>,
     task: Option<JoinHandle<()>>,
+    shutdown: Option<oneshot::Sender<()>>,
 }
 
 impl TransportHandle {
@@ -156,9 +161,29 @@ impl TransportHandle {
     }
 
     pub fn shutdown(&mut self) {
-        let _ = self.commands.try_send(TransportCommand::Shutdown);
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
         if let Some(task) = self.task.take() {
-            task.abort();
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                runtime.spawn(async move {
+                    let deadline = tokio::time::Instant::now() + Duration::from_millis(200);
+                    while !task.is_finished() && tokio::time::Instant::now() < deadline {
+                        tokio::time::sleep(Duration::from_millis(2)).await;
+                    }
+                    if !task.is_finished() {
+                        task.abort();
+                    }
+                });
+                return;
+            }
+            let deadline = Instant::now() + Duration::from_millis(200);
+            while !task.is_finished() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(2));
+            }
+            if !task.is_finished() {
+                task.abort();
+            }
         }
     }
 }
@@ -180,11 +205,13 @@ pub fn start_with_limits(
     let limits = limits.clamp();
     let (command_tx, command_rx) = mpsc::channel(limits.max_command_queue);
     let (event_tx, event_rx) = mpsc::channel(limits.max_event_queue);
-    let task = tokio::spawn(driver(listen, command_rx, event_tx, limits));
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let task = tokio::spawn(driver(listen, command_rx, event_tx, limits, shutdown_rx));
     Ok(TransportHandle {
         commands: command_tx,
         events: event_rx,
         task: Some(task),
+        shutdown: Some(shutdown_tx),
     })
 }
 
@@ -196,6 +223,16 @@ pub fn default_listen_addr() -> SocketAddr {
 }
 
 type Writers = Arc<Mutex<HashMap<SocketAddr, mpsc::Sender<Vec<u8>>>>>;
+type Tasks = Arc<Mutex<Vec<JoinHandle<()>>>>;
+
+#[derive(Clone)]
+struct ConnectionContext {
+    event_tx: mpsc::Sender<TransportEvent>,
+    writers: Writers,
+    limiter: Arc<FrameRateLimiter>,
+    tasks: Tasks,
+    write_queue: usize,
+}
 
 #[derive(Debug)]
 struct TokenBucket {
@@ -239,13 +276,14 @@ async fn driver(
     mut commands: mpsc::Receiver<TransportCommand>,
     events: mpsc::Sender<TransportEvent>,
     limits: NetworkLimits,
+    mut shutdown: oneshot::Receiver<()>,
 ) {
     let limits = limits.clamp();
     let writers: Writers = Arc::new(Mutex::new(HashMap::new()));
+    let tasks: Tasks = Arc::new(Mutex::new(Vec::new()));
     let limiter = Arc::new(FrameRateLimiter::default());
     let permits = Arc::new(Semaphore::new(limits.max_connections));
     let mut listener: Option<JoinHandle<()>> = None;
-    let mut tasks: Vec<JoinHandle<()>> = Vec::new();
 
     start_listener(
         listen,
@@ -254,92 +292,100 @@ async fn driver(
         &permits,
         limits.max_write_queue,
         &mut listener,
+        &tasks,
     );
 
-    while let Some(command) = commands.recv().await {
-        match command {
-            TransportCommand::Listen(address) => {
-                start_listener(
-                    address,
-                    &events,
-                    &writers,
-                    &permits,
-                    limits.max_write_queue,
-                    &mut listener,
-                );
-            }
-            TransportCommand::Connect(peer) => {
-                let event_tx = events.clone();
-                let writers = writers.clone();
-                let permits = permits.clone();
-                let limiter = limiter.clone();
-                let write_queue = limits.max_write_queue;
-                tasks.push(tokio::spawn(async move {
-                    if let Err(error) = connect(
-                        peer,
-                        event_tx.clone(),
-                        writers,
-                        permits,
-                        limiter,
-                        write_queue,
-                    )
-                    .await
-                    {
-                        emit_error(&event_tx, peer, error);
+    loop {
+        tokio::select! {
+            maybe_command = commands.recv() => {
+                let Some(command) = maybe_command else { break };
+                match command {
+                    TransportCommand::Listen(address) => {
+                        start_listener(
+                            address,
+                            &events,
+                            &writers,
+                            &permits,
+                            limits.max_write_queue,
+                            &mut listener,
+                            &tasks,
+                        );
                     }
-                }));
-            }
-            TransportCommand::Disconnect(peer) => {
-                let writer = writers.lock().await.remove(&peer);
-                if let Some(writer) = writer {
-                    drop(writer);
-                    emit(
-                        &events,
-                        TransportEvent::Disconnected(peer, "closed by local user".into()),
-                    );
-                }
-            }
-            TransportCommand::Send { peer, frame } => {
-                if frame.len() > MAX_FRAME_BYTES {
-                    emit(
-                        &events,
-                        TransportEvent::Error {
-                            peer: Some(peer),
-                            message: "frame exceeds maximum allowed size".into(),
-                        },
-                    );
-                    continue;
-                }
-                let writer = writers.lock().await.get(&peer).cloned();
-                match writer {
-                    Some(writer) => {
-                        if writer.try_send(frame).is_err() {
+                    TransportCommand::Connect(peer) => {
+                        let context = ConnectionContext {
+                            event_tx: events.clone(),
+                            writers: writers.clone(),
+                            limiter: limiter.clone(),
+                            tasks: tasks.clone(),
+                            write_queue: limits.max_write_queue,
+                        };
+                        let event_tx = context.event_tx.clone();
+                        let permits = permits.clone();
+                        let task = tokio::spawn(async move {
+                            if let Err(error) = connect(peer, permits, context).await {
+                                emit(
+                                    &event_tx,
+                                    TransportEvent::ConnectFailed(peer, error.to_string()),
+                                );
+                            }
+                        });
+                        tasks.lock().await.push(task);
+                    }
+                    TransportCommand::Disconnect(peer) => {
+                        let writer = writers.lock().await.remove(&peer);
+                        if let Some(writer) = writer {
+                            drop(writer);
+                            emit(
+                                &events,
+                                TransportEvent::Disconnected(peer, "closed by local user".into()),
+                            );
+                        }
+                    }
+                    TransportCommand::Send { peer, frame } => {
+                        if frame.len() > MAX_FRAME_BYTES {
                             emit(
                                 &events,
                                 TransportEvent::Error {
                                     peer: Some(peer),
-                                    message: "peer write queue is full or closed".into(),
+                                    message: "frame exceeds maximum allowed size".into(),
                                 },
                             );
+                            continue;
+                        }
+                        let writer = writers.lock().await.get(&peer).cloned();
+                        match writer {
+                            Some(writer) => {
+                                if writer.try_send(frame).is_err() {
+                                    emit(
+                                        &events,
+                                        TransportEvent::Error {
+                                            peer: Some(peer),
+                                            message: "peer write queue is full or closed".into(),
+                                        },
+                                    );
+                                }
+                            }
+                            None => emit(
+                                &events,
+                                TransportEvent::Error {
+                                    peer: Some(peer),
+                                    message: "not connected to peer".into(),
+                                },
+                            ),
                         }
                     }
-                    None => emit(
-                        &events,
-                        TransportEvent::Error {
-                            peer: Some(peer),
-                            message: "not connected to peer".into(),
-                        },
-                    ),
+                    TransportCommand::Shutdown => break,
                 }
             }
-            TransportCommand::Shutdown => break,
+            _ = &mut shutdown => break,
         }
     }
 
     if let Some(listener) = listener.take() {
         listener.abort();
     }
-    for task in tasks.drain(..) {
+    writers.lock().await.clear();
+    for task in tasks.lock().await.drain(..) {
         task.abort();
     }
 }
@@ -351,6 +397,7 @@ fn start_listener(
     permits: &Arc<Semaphore>,
     write_queue: usize,
     listener: &mut Option<JoinHandle<()>>,
+    tasks: &Tasks,
 ) {
     if let Some(old) = listener.take() {
         old.abort();
@@ -358,6 +405,7 @@ fn start_listener(
     let event_tx = events.clone();
     let writers = writers.clone();
     let permits = permits.clone();
+    let tasks = tasks.clone();
     let limiter = Arc::new(FrameRateLimiter::default());
     *listener = Some(tokio::spawn(async move {
         let bound = match TcpListener::bind(listen).await {
@@ -427,49 +475,35 @@ fn start_listener(
                 continue;
             }
             emit(&event_tx, TransportEvent::Incoming(peer));
-            register_connection(
-                stream,
-                peer,
-                permit,
-                event_tx.clone(),
-                writers.clone(),
-                limiter.clone(),
+            let context = ConnectionContext {
+                event_tx: event_tx.clone(),
+                writers: writers.clone(),
+                limiter: limiter.clone(),
+                tasks: tasks.clone(),
                 write_queue,
-            )
-            .await;
+            };
+            register_connection(stream, peer, permit, context).await;
         }
     }));
 }
 
 async fn connect(
     peer: SocketAddr,
-    event_tx: mpsc::Sender<TransportEvent>,
-    writers: Writers,
     permits: Arc<Semaphore>,
-    limiter: Arc<FrameRateLimiter>,
-    write_queue: usize,
+    context: ConnectionContext,
 ) -> Result<(), NetworkError> {
     let permit = permits
         .clone()
         .try_acquire_owned()
         .map_err(|_| NetworkError::TooManyConnections)?;
-    if writers.lock().await.contains_key(&peer) {
+    if context.writers.lock().await.contains_key(&peer) {
         return Err(NetworkError::AlreadyConnected(peer));
     }
     let stream = timeout(CONNECT_TIMEOUT, TcpStream::connect(peer))
         .await
         .map_err(|_| NetworkError::Timeout)?
         .map_err(NetworkError::Io)?;
-    register_connection(
-        stream,
-        peer,
-        permit,
-        event_tx,
-        writers,
-        limiter,
-        write_queue,
-    )
-    .await;
+    register_connection(stream, peer, permit, context).await;
     Ok(())
 }
 
@@ -477,11 +511,15 @@ async fn register_connection(
     stream: TcpStream,
     peer: SocketAddr,
     permit: OwnedSemaphorePermit,
-    event_tx: mpsc::Sender<TransportEvent>,
-    writers: Writers,
-    limiter: Arc<FrameRateLimiter>,
-    write_queue: usize,
+    context: ConnectionContext,
 ) {
+    let ConnectionContext {
+        event_tx,
+        writers,
+        limiter,
+        tasks,
+        write_queue,
+    } = context;
     let (writer_tx, writer_rx) = mpsc::channel(write_queue);
     {
         let mut writers = writers.lock().await;
@@ -492,14 +530,16 @@ async fn register_connection(
     let (reader, writer) = stream.into_split();
     let writer_events = event_tx.clone();
     let writer_writers = writers.clone();
-    tokio::spawn(async move {
+    let writer_task = tokio::spawn(async move {
         let _permit = permit;
         writer_loop(writer, peer, writer_rx, &writer_events, &writer_writers).await;
     });
-
-    tokio::spawn(async move {
+    let reader_task = tokio::spawn(async move {
         reader_loop(reader, peer, &event_tx, &writers, &limiter).await;
     });
+    let mut registry = tasks.lock().await;
+    registry.push(writer_task);
+    registry.push(reader_task);
 }
 
 async fn reader_loop(
@@ -571,16 +611,6 @@ async fn cleanup(
 
 fn emit(events: &mpsc::Sender<TransportEvent>, event: TransportEvent) {
     let _ = events.try_send(event);
-}
-
-fn emit_error(events: &mpsc::Sender<TransportEvent>, peer: SocketAddr, error: NetworkError) {
-    emit(
-        events,
-        TransportEvent::Error {
-            peer: Some(peer),
-            message: error.to_string(),
-        },
-    );
 }
 
 async fn read_frame<R: AsyncReadExt + Unpin>(stream: &mut R) -> Result<Vec<u8>, NetworkError> {
@@ -705,6 +735,61 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(result, Err(NetworkError::FrameTooLarge(_))));
+    }
+
+    #[tokio::test]
+    async fn connect_failure_is_reported() {
+        let mut handle = start("127.0.0.1:0".parse().unwrap()).unwrap();
+        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer = probe.local_addr().unwrap();
+        drop(probe);
+
+        handle.command(TransportCommand::Connect(peer)).unwrap();
+        let event = wait_for(
+            &mut handle,
+            |event| matches!(event, TransportEvent::ConnectFailed(address, _) if *address == peer),
+        )
+        .await;
+        assert!(matches!(event, TransportEvent::ConnectFailed(_, reason) if !reason.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn shutdown_closes_connections_promptly() {
+        let mut alice = start("127.0.0.1:0".parse().unwrap()).unwrap();
+        let mut bob = start("127.0.0.1:0".parse().unwrap()).unwrap();
+        let TransportEvent::Listening(bob_addr) = wait_for(&mut bob, |event| {
+            matches!(event, TransportEvent::Listening(_))
+        })
+        .await
+        else {
+            panic!("expected listener");
+        };
+
+        alice.command(TransportCommand::Connect(bob_addr)).unwrap();
+        wait_for(
+            &mut alice,
+            |event| matches!(event, TransportEvent::Connected(address) if *address == bob_addr),
+        )
+        .await;
+        wait_for(&mut bob, |event| {
+            matches!(event, TransportEvent::Incoming(_))
+        })
+        .await;
+
+        alice.shutdown();
+        let event = timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(event) = bob.try_event() {
+                    if matches!(event, TransportEvent::Disconnected(_, _)) {
+                        return event;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("peer should observe disconnect promptly");
+        assert!(matches!(event, TransportEvent::Disconnected(_, _)));
     }
 
     #[test]

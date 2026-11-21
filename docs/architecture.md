@@ -30,4 +30,6 @@ The initial UI recognizes some future commands to reserve a discoverable command
 - Distinguish a local transport write from remote receipt or acknowledgement.
 - Keep relays unable to decrypt end-to-end message content; do not imply anonymity or resistance to traffic analysis.
 - Keep the UI responsive and restore terminal mode cleanly on exit and errors.
+- Recovery is fail-closed and explicit: malformed config/trust files are quarantined with a visible path, trust failures start with no trusted peers, and reconnects always redo authentication instead of reusing an old session.
+- Explicit connections use bounded reconnect backoff; users cancel retries with `/disconnect`.
 
