@@ -33,7 +33,7 @@ cargo run -p ghost-terminal
 
 On first launch the terminal asks for a username and passphrase, then stores an encrypted identity under `~/.local/share/ghost/identity.ghost` (or `$XDG_DATA_HOME/ghost/identity.ghost`). Later launches ask for the passphrase to unlock it; no secret is printed.
 
-Inside the terminal, use `/help` for the built-in command list. `/quit`, Escape, or Ctrl-C exits cleanly. The listener defaults to `127.0.0.1:0`; set `GHOST_LISTEN` to choose another bind address, edit `config.toml` in the data directory, or use `/listen <ip:port>`. Share the printed listening address with the other terminal, then use `/connect <ip:port>` and `/ping <ip:port>`. `/scan` lists mDNS/DNS-SD candidates; if multicast is blocked, manual connection still works.
+Inside the terminal, use `/help` for the built-in command list. `/quit`, Escape, or Ctrl-C exits cleanly. The listener defaults to `127.0.0.1:0`; set `GHOST_LISTEN` to choose another bind address, edit `config.toml` in the data directory, or use `/listen <ip:port>`. Share the printed listening address with the other terminal, then use `/connect <ip:port>` and `/ping <ip:port>`. `/scan` lists mDNS/DNS-SD candidates; if multicast is blocked, manual connection still works. Explicit `/connect` targets retry with bounded backoff; `/disconnect <ip:port>` cancels retries. Reconnects always perform a fresh authenticated handshake.
 
 | COMMAND | STATUS |
 | --- | --- |
@@ -61,7 +61,7 @@ docs/
 - [Technical specification and implementation blueprint](<docs/PROJECT GHOST — Technical Specification and Implementation Blueprint.md>) — the source document for product scope, architecture, threat model, development stages, risks, and release criteria.
 - [Architecture and implementation sequence](docs/architecture.md) — crate boundaries and the short staged plan.
 - [Wire protocol and cryptographic design](docs/protocol.md) — envelope, framing, validation limits, threat model, and conservative security claims.
-- [Identity backup and recovery](docs/recovery.md) — encrypted export/import, device loss and revocation/replacement, and key-rotation limitations.
+- [Identity backup and recovery](docs/recovery.md) — encrypted export/import, crash/restart behavior, reconnect behavior, device loss and revocation/replacement, and key-rotation limitations.
 - [Tracked issues](https://github.com/Josh-L23/ghost/issues) — actionable work grouped by area with acceptance criteria and dependencies.
 
 ## Development direction

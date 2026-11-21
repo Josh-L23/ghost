@@ -1,9 +1,9 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     error::Error,
     io,
     net::SocketAddr,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use crossterm::{
@@ -39,10 +39,18 @@ use ratatui::{
 use zeroize::Zeroizing;
 
 const RECEIPT_TIMEOUT_SECS: u64 = 60;
+const RECONNECT_INITIAL_DELAY: Duration = Duration::from_millis(500);
+const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(30);
+const MAX_RECONNECT_ATTEMPTS: u32 = 8;
 const MAX_TIMELINE_LINES: usize = 500;
 const MAX_SAFE_TEXT: usize = 512;
 const MAX_SAFE_LABEL: usize = 64;
 const MAX_CONNECTION_ENTRIES: usize = MAX_CONNECTIONS * 2;
+
+struct ReconnectState {
+    next_attempt: Instant,
+    attempts: u32,
+}
 
 struct App {
     input: String,
@@ -58,6 +66,8 @@ struct App {
     discovery: DiscoveryHandle,
     discovered: Vec<DiscoveredPeer>,
     connections: Vec<(SocketAddr, ConnectionState)>,
+    reconnect_targets: HashSet<SocketAddr>,
+    reconnect: HashMap<SocketAddr, ReconnectState>,
     listen_addr: Option<SocketAddr>,
     handshakes: HashMap<SocketAddr, PendingSession>,
     sessions: HashMap<SocketAddr, EstablishedSession>,
@@ -89,6 +99,8 @@ impl App {
             discovery,
             discovered: Vec::new(),
             connections: Vec::new(),
+            reconnect_targets: HashSet::new(),
+            reconnect: HashMap::new(),
             listen_addr: None,
             handshakes: HashMap::new(),
             sessions: HashMap::new(),
@@ -142,6 +154,91 @@ impl App {
         self.push_line("Warnings acknowledged.".into());
     }
 
+    fn schedule_reconnect(&mut self, peer: SocketAddr, reason: &str) {
+        if !self.reconnect_targets.contains(&peer) {
+            return;
+        }
+        let attempts = self
+            .reconnect
+            .get(&peer)
+            .map(|state| state.attempts)
+            .unwrap_or(0);
+        if attempts >= MAX_RECONNECT_ATTEMPTS {
+            self.reconnect.remove(&peer);
+            self.reconnect_targets.remove(&peer);
+            self.set_connection_state(peer, ConnectionState::Disconnected);
+            self.warn(format!(
+                "Gave up reconnecting to {peer} after {attempts} attempts."
+            ));
+            return;
+        }
+        let next = attempts + 1;
+        let delay = reconnect_delay(next);
+        self.reconnect.insert(
+            peer,
+            ReconnectState {
+                next_attempt: Instant::now() + delay,
+                attempts: next,
+            },
+        );
+        self.push_line(format!(
+            "[RETRY] {peer}: {}; retry {next}/{MAX_RECONNECT_ATTEMPTS} in {:?}.",
+            sanitize_display(reason, MAX_SAFE_TEXT),
+            delay
+        ));
+    }
+
+    fn handle_peer_loss(&mut self, peer: SocketAddr, reason: &str, reset_retry: bool) {
+        self.handshakes.remove(&peer);
+        self.sessions.remove(&peer);
+        self.set_connection_state(peer, ConnectionState::Disconnected);
+        self.push_line(format!(
+            "[DISCONNECTED] {peer}: {}",
+            sanitize_display(reason, MAX_SAFE_TEXT)
+        ));
+        if reset_retry {
+            self.reconnect.remove(&peer);
+        }
+        self.schedule_reconnect(peer, reason);
+    }
+
+    fn process_reconnects(&mut self) {
+        let now = Instant::now();
+        let due: Vec<SocketAddr> = self
+            .reconnect
+            .iter()
+            .filter(|(_, state)| now >= state.next_attempt)
+            .map(|(peer, _)| *peer)
+            .collect();
+        for peer in due {
+            let Some(state) = self.reconnect.remove(&peer) else {
+                continue;
+            };
+            if self.sessions.contains_key(&peer) || self.handshakes.contains_key(&peer) {
+                self.set_connection_state(peer, ConnectionState::Connected);
+                continue;
+            }
+            if state.attempts > MAX_RECONNECT_ATTEMPTS {
+                self.reconnect_targets.remove(&peer);
+                self.set_connection_state(peer, ConnectionState::Disconnected);
+                self.warn(format!(
+                    "Gave up reconnecting to {peer} after {} attempts.",
+                    state.attempts - 1
+                ));
+                continue;
+            }
+            self.set_connection_state(peer, ConnectionState::Reconnecting(state.attempts));
+            if self.send_command(TransportCommand::Connect(peer)) {
+                self.push_line(format!(
+                    "[RETRY] Reconnecting to {peer} (attempt {}/{MAX_RECONNECT_ATTEMPTS}).",
+                    state.attempts
+                ));
+            } else {
+                self.schedule_reconnect(peer, "reconnect command failed");
+            }
+        }
+    }
+
     fn handle_input(&mut self) {
         let input = std::mem::take(&mut self.input);
         if input.trim().is_empty() {
@@ -157,7 +254,8 @@ impl App {
                 "          /relay status|enable|disable /clear /ack /quit".into(),
                 "/whoami shows your username and identity fingerprint.".into(),
                 "Peers may be selected by label, short fingerprint, or full fingerprint.".into(),
-                "TCP is manual-only; sessions require verified peer fingerprints.".into(),
+                "TCP starts manually; explicit connections retry with bounded backoff after drops.".into(),
+                "Sessions always require verified peer fingerprints; /disconnect cancels retries.".into(),
                 "/scan is optional; mDNS may be blocked, so /connect <ip:port> always works.".into(),
                 "Discovered peers are never trusted or contacted without your approval.".into(),
                 "Delivery indicators are text; a transport write is not a receipt.".into(),
@@ -259,11 +357,15 @@ impl App {
                 self.push_line(format!("Requesting listener on {address}."));
             }
             Ok(Command::Connect(address)) => {
+                self.reconnect_targets.insert(address);
+                self.reconnect.remove(&address);
                 self.set_connection_state(address, ConnectionState::Connecting);
                 self.send_command(TransportCommand::Connect(address));
                 self.push_line(format!("Connecting to {address}."));
             }
             Ok(Command::Disconnect(address)) => {
+                self.reconnect_targets.remove(&address);
+                self.reconnect.remove(&address);
                 self.send_command(TransportCommand::Disconnect(address));
                 self.set_connection_state(address, ConnectionState::Disconnected);
                 self.push_line(format!("Closing connection to {address}."));
@@ -390,15 +492,17 @@ impl App {
                     self.start_handshake(peer);
                 }
                 TransportEvent::Connected(peer) => {
+                    self.reconnect.remove(&peer);
                     self.set_connection_state(peer, ConnectionState::Connected);
                     self.push_line(format!("[CONNECTED] {peer}"));
                     self.start_handshake(peer);
                 }
+                TransportEvent::ConnectFailed(peer, reason) => {
+                    self.handle_peer_loss(peer, &reason, false);
+                    self.warn(format!("Connection to {peer} failed: {reason}"));
+                }
                 TransportEvent::Disconnected(peer, reason) => {
-                    self.set_connection_state(peer, ConnectionState::Disconnected);
-                    self.handshakes.remove(&peer);
-                    self.sessions.remove(&peer);
-                    self.push_line(format!("[DISCONNECTED] {peer}: {reason}"));
+                    self.handle_peer_loss(peer, &reason, true);
                 }
                 TransportEvent::Frame { peer, frame } => self.handle_session_frame(peer, frame),
                 TransportEvent::Error { peer, message } => {
@@ -704,7 +808,12 @@ impl App {
                 let remove = self
                     .connections
                     .iter()
-                    .position(|(_, state)| *state == ConnectionState::Disconnected)
+                    .position(|(_, state)| {
+                        matches!(
+                            state,
+                            ConnectionState::Disconnected | ConnectionState::Reconnecting(_)
+                        )
+                    })
                     .unwrap_or(0);
                 self.connections.remove(remove);
             }
@@ -790,6 +899,13 @@ fn describe_control_event(peer: SocketAddr, payload_len: usize) -> String {
     format!("[PING] {peer}: control probe acknowledged ({payload_len} bytes)")
 }
 
+fn reconnect_delay(attempt: u32) -> Duration {
+    let shift = attempt.saturating_sub(1).min(16);
+    RECONNECT_INITIAL_DELAY
+        .saturating_mul(1u32 << shift)
+        .min(RECONNECT_MAX_DELAY)
+}
+
 fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -826,13 +942,13 @@ fn main() -> Result<(), Box<dyn Error>> {
 
 fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<(), Box<dyn Error>> {
     let identity = setup_identity(terminal)?;
-    let trust = TrustStore::load_or_empty(trust::default_trust_path()?)?;
+    let (trust, trust_recovery) = TrustStore::load_or_safe_empty(trust::default_trust_path()?)?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
     let _guard = runtime.enter();
     let discovery_label = identity.username().to_owned();
-    let config = Config::load_or_create(config::default_config_path()?)?;
+    let (config, config_recovery) = Config::load_or_safe_default(config::default_config_path()?)?;
     let listen = std::env::var("GHOST_LISTEN")
         .ok()
         .and_then(|value| value.parse().ok())
@@ -846,8 +962,21 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<(), Box<
     let transport = ghost_network::start_with_limits(listen, limits)?;
     let discovery = ghost_network::discovery::start(discovery_label);
     let mut app = App::new(identity, trust, transport, discovery);
+    if let Some(path) = config_recovery {
+        app.warn(format!(
+            "Config was unreadable; defaults loaded and the old file moved to {}.",
+            path.display()
+        ));
+    }
+    if let Some(path) = trust_recovery {
+        app.warn(format!(
+            "Trust records were unreadable; starting with no trusted peers and the old file moved to {}.",
+            path.display()
+        ));
+    }
 
     while !app.should_quit {
+        app.process_reconnects();
         app.drain_events();
         app.expire_pending(now());
         terminal.draw(|frame| draw(frame, &app))?;
@@ -1046,12 +1175,19 @@ fn unlock_identity(
     store: &IdentityStore,
 ) -> Result<Identity, Box<dyn Error>> {
     let mut notice = "Unlock your local identity.".to_owned();
+    let mut failures = 0u32;
     loop {
         let passphrase = prompt(terminal, "Passphrase", &notice, true)?;
         match store.load(passphrase.as_bytes()) {
             Ok(identity) => return Ok(identity),
             Err(IdentityError::WrongPassphrase) => {
-                notice = "Incorrect passphrase. Try again or press Esc to cancel.".into();
+                failures += 1;
+                notice = if failures >= 3 {
+                    "Repeated failures may mean a wrong passphrase or a corrupt identity file. See docs/recovery.md; press Esc to quit."
+                        .into()
+                } else {
+                    "Incorrect passphrase. Try again or press Esc to cancel.".into()
+                };
             }
             Err(error) => return Err(Box::new(error)),
         }
@@ -1207,5 +1343,17 @@ mod tests {
     fn warnings_are_textual_and_acknowledgement_is_parseable() {
         assert_eq!(ghost_core::command::parse("/ack").unwrap(), Command::Ack);
         assert!(sanitize_display("ada\r\n[VERIFIED]", MAX_SAFE_LABEL).contains('?'));
+    }
+
+    #[test]
+    fn reconnect_backoff_is_bounded_and_grows() {
+        let first = reconnect_delay(1);
+        let second = reconnect_delay(2);
+        assert_eq!(first, RECONNECT_INITIAL_DELAY);
+        assert!(second > first);
+        for attempt in 1..=MAX_RECONNECT_ATTEMPTS * 4 {
+            assert!(reconnect_delay(attempt) >= RECONNECT_INITIAL_DELAY);
+            assert!(reconnect_delay(attempt) <= RECONNECT_MAX_DELAY);
+        }
     }
 }

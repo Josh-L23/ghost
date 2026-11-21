@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::{fmt, fs, path::PathBuf};
 
 use crate::{
+    fsutil,
     identity::{default_data_dir, fingerprint_from_public_key},
     protocol::{BoundedBytes, IdentityId, read_bounded},
 };
@@ -168,6 +169,19 @@ impl TrustStore {
         }
         store.records = stored.records;
         Ok(store)
+    }
+
+    pub fn load_or_safe_empty(
+        path: impl Into<PathBuf>,
+    ) -> Result<(Self, Option<PathBuf>), TrustError> {
+        let path = path.into();
+        match Self::load_or_empty(path.clone()) {
+            Ok(store) => Ok((store, None)),
+            Err(error) => {
+                let quarantined = fsutil::quarantine(&path, &error.to_string())?;
+                Ok((Self::new(path), Some(quarantined)))
+            }
+        }
     }
 
     pub fn records(&self) -> &[TrustRecord] {
@@ -347,28 +361,7 @@ fn decode_hex(input: &str) -> Option<Vec<u8>> {
 }
 
 fn write_file(path: &std::path::Path, bytes: &[u8]) -> Result<(), TrustError> {
-    use std::io::Write;
-
-    if let Some(parent) = path.parent() {
-        let mut builder = fs::DirBuilder::new();
-        builder.recursive(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            builder.mode(0o700);
-        }
-        builder.create(parent)?;
-    }
-    let mut options = fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options.open(path)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
+    fsutil::atomic_write(path, bytes, 0o600, true)?;
     Ok(())
 }
 
@@ -528,6 +521,19 @@ mod tests {
         let path = dir.path().join("trust.ghost");
         fs::write(&path, b"not trust data").unwrap();
         assert!(TrustStore::load_or_empty(&path).is_err());
+    }
+
+    #[test]
+    fn corrupt_trust_is_quarantined_and_fails_closed() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("trust.ghost");
+        fs::write(&path, b"not trust data").unwrap();
+
+        let (store, quarantined) = TrustStore::load_or_safe_empty(&path).unwrap();
+        assert!(store.records().is_empty());
+        let quarantined = quarantined.expect("expected quarantine path");
+        assert!(quarantined.exists());
+        assert_eq!(store.state_of(&identity(1)), TrustState::Unverified);
     }
 
     #[test]

@@ -10,17 +10,18 @@ use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    env, fmt,
-    fs::{self, DirBuilder, OpenOptions},
-    io::Write,
+    env, fmt, fs,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
 use zeroize::Zeroizing;
 
-use crate::protocol::{
-    BoundedBytes, Envelope, IdentityId, MessageId, MessageType, ProtocolError, Recipient,
-    RoutingMetadata, Signature, encode_frame, read_bounded,
+use crate::{
+    fsutil,
+    protocol::{
+        BoundedBytes, Envelope, IdentityId, MessageId, MessageType, ProtocolError, Recipient,
+        RoutingMetadata, Signature, encode_frame, read_bounded,
+    },
 };
 
 const MAGIC: &[u8; 8] = b"GHOSTID1";
@@ -469,27 +470,7 @@ fn associated_data(
 }
 
 fn write_new_file(path: &Path, bytes: &[u8]) -> Result<(), IdentityError> {
-    if let Some(parent) = path.parent() {
-        let mut builder = DirBuilder::new();
-        builder.recursive(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            builder.mode(0o700);
-        }
-        builder.create(parent)?;
-    }
-
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options.open(path)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
+    fsutil::atomic_write(path, bytes, 0o600, false)?;
     Ok(())
 }
 

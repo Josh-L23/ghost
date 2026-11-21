@@ -25,6 +25,15 @@ Operational guidance:
 
 A recovered identity has the same public key and fingerprint as the original. Peers that previously verified that fingerprint can continue to recognize it, subject to their own local trust policy.
 
+## Local state after crashes, restarts, and network loss
+
+- `config.toml` and `trust.ghost` are written atomically through a temporary file, file sync, and rename. If a file is unreadable or malformed at startup, it is moved aside as `<name>.corrupt.<unix-seconds>` (with a numeric suffix if needed), defaults or an empty trust store are loaded, and the terminal shows a warning with the quarantined path.
+- A corrupt trust file fails closed: the session starts with no trusted peers. Verification always requires an out-of-band fingerprint comparison; reconnecting never makes an unverified peer trusted.
+- Identity creation, export, and import use atomic file creation so a partially written `identity.ghost` should not replace a valid file. A wrong passphrase and a corrupt identity container cannot be distinguished cryptographically; after repeated failures the terminal points back to this document rather than silently resetting identity state.
+- `Storage::open_or_quarantined` in `ghost-core` can move a corrupt `ghost.db` plus its `-wal`/`-shm` sidecars aside and recreate an empty database. The current terminal does not yet open this database, so this is adapter-level behavior rather than a claim about persisted terminal history.
+- Explicit connections made with `/connect` are retried automatically with bounded exponential backoff (500 ms initially, capped at 30 seconds, up to 8 attempts). `/disconnect` removes the target and cancels pending retries.
+- Every reconnection, including a transport restart, performs a fresh authenticated handshake and creates a new session. Frames from an old session are rejected; no prior session key is silently reused. Verified trust records survive restart and are not changed by a reconnect.
+
 ## Device loss and revocation/replacement
 
 - **Lost device / suspected compromise:** assume the endpoint and any decrypted plaintext/history accessible on it may be exposed. Endpoint compromise can expose plaintext after decryption; at-rest encryption does not protect data from a fully compromised running device.
