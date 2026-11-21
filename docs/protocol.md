@@ -1,6 +1,6 @@
 # GHOST v1 wire protocol and cryptographic design
 
-Status: proposed v1 design reviewed against the technical blueprint. It is not an external security audit and is not a production-security claim. `ghost-core` implements the envelope types, framing, validation rules, identity, trust records, authenticated ephemeral sessions, encrypted direct messages, explicit delivery receipts, and bounded replay protection; `ghost-network` implements bounded manual TCP transport. Groups, relaying, and storage are tracked in separate issues.
+Status: proposed v1 design reviewed against the technical blueprint. It is not an external security audit and is not a production-security claim. `ghost-core` implements the envelope types, framing, validation rules, identity, trust records, authenticated ephemeral sessions, encrypted direct messages, explicit delivery receipts, and bounded replay protection; `ghost-network` implements bounded manual TCP transport. Groups, relaying, and storage are tracked in separate issues. The group membership and key-management decision is recorded separately in [group-security.md](group-security.md).
 
 Source: [technical blueprint](<PROJECT GHOST — Technical Specification and Implementation Blueprint.md>) sections 6, 7.4, 8, 9, 12, 13, 16, and 17.
 

@@ -19,7 +19,7 @@ The initial UI recognizes some future commands to reserve a discoverable command
 4. Add authenticated peer sessions, fingerprint verification, then direct encrypted private messaging and acknowledgement state.
 5. Add persistence with encrypted message bodies and history controls.
 6. Add local peer discovery after manual connections are reliable.
-7. Evaluate reviewed group key management (including MLS) before group messaging.
+7. Evaluate reviewed group key management and use the decision in [group-security.md](group-security.md) before group messaging.
 8. Add explicit, scoped, revocable relay grants and bounded multi-hop forwarding only after direct messaging is stable.
 9. Add Bluetooth through a platform adapter after Wi-Fi behavior is established.
 
