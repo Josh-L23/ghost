@@ -8,6 +8,8 @@ What if you could talk to you'r computer science geeks through the terminal ? Sa
 
 ## Current state
 
+This is a learning project. It is not audited and makes no production-security or anonymity claim.
+
 - Rust workspace with UI-independent `ghost-core` and `ghost-network` crates and a Ratatui/Crossterm terminal shell.
 - Slash commands are parsed, including quoted arguments and backslash escaping.
 - A versioned wire envelope with bounded validation rules, a passphrase-protected local identity, and a persistent peer trust store are defined in `ghost-core`.
@@ -25,7 +27,7 @@ What if you could talk to you'r computer science geeks through the terminal ? Sa
 
 ## Run
 
-Requires a stable Rust toolchain (see `rust-toolchain.toml`); Linux desktop is the first target.
+Requires a stable Rust toolchain (see `rust-toolchain.toml`); Linux desktop is the first target. Windows, macOS, and Bluetooth are not supported yet. See [docs/release.md](docs/release.md) for the full two-peer setup walkthrough, security limitations, and release status.
 
 ```sh
 cargo run -p ghost-terminal
@@ -62,6 +64,7 @@ docs/
 - [Architecture and implementation sequence](docs/architecture.md) — crate boundaries and the short staged plan.
 - [Wire protocol and cryptographic design](docs/protocol.md) — envelope, framing, validation limits, threat model, and conservative security claims.
 - [Identity backup and recovery](docs/recovery.md) — encrypted export/import, crash/restart behavior, reconnect behavior, device loss and revocation/replacement, and key-rotation limitations.
+- [Current milestone release notes](docs/release.md) — setup, two-peer walkthrough, command status, threat model, limitations, release criteria, and known risks.
 - [Tracked issues](https://github.com/Josh-L23/ghost/issues) — actionable work grouped by area with acceptance criteria and dependencies.
 
 ## Development direction
