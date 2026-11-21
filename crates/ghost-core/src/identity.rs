@@ -20,7 +20,7 @@ use zeroize::Zeroizing;
 
 use crate::protocol::{
     BoundedBytes, Envelope, IdentityId, MessageId, MessageType, ProtocolError, Recipient,
-    RoutingMetadata, Signature, encode_frame,
+    RoutingMetadata, Signature, encode_frame, read_bounded,
 };
 
 const MAGIC: &[u8; 8] = b"GHOSTID1";
@@ -245,7 +245,7 @@ impl IdentityStore {
     }
 
     pub fn export(&self, dest: impl AsRef<Path>) -> Result<(), IdentityError> {
-        let bytes = fs::read(&self.path)?;
+        let bytes = read_bounded(&self.path, MAX_FILE_BYTES)?;
         Self::parse_stored(&bytes)?;
         let dest = dest.as_ref();
         if dest.exists() {
@@ -259,7 +259,7 @@ impl IdentityStore {
         if self.exists() {
             return Err(IdentityError::AlreadyExists);
         }
-        let bytes = fs::read(src.as_ref())?;
+        let bytes = read_bounded(src.as_ref(), MAX_FILE_BYTES)?;
         Self::parse_stored(&bytes)?;
         write_new_file(&self.path, &bytes)?;
         Ok(())
@@ -335,7 +335,7 @@ impl IdentityStore {
     pub fn load(&self, passphrase: &[u8]) -> Result<Identity, IdentityError> {
         validate_passphrase(passphrase)?;
         check_permissions(&self.path)?;
-        let bytes = fs::read(&self.path)?;
+        let bytes = read_bounded(&self.path, MAX_FILE_BYTES)?;
         let stored = Self::parse_stored(&bytes)?;
 
         let username = String::from_utf8(stored.username.as_slice().to_vec())
@@ -582,6 +582,21 @@ mod tests {
             store.load(passphrase()),
             Err(IdentityError::Io(_))
         ));
+    }
+
+    #[test]
+    fn oversized_identity_file_is_rejected_before_decoding() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("identity.ghost");
+        let store = IdentityStore::new(&path);
+        store.create("ada", passphrase()).unwrap();
+        fs::write(&path, vec![0; MAX_FILE_BYTES + 1]).unwrap();
+
+        let error = match store.load(passphrase()) {
+            Ok(_) => panic!("oversized identity file was accepted"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("maximum allowed size"));
     }
 
     #[test]

@@ -8,6 +8,11 @@ use serde::{
     de::{SeqAccess, Visitor},
     ser::{SerializeSeq, SerializeTuple},
 };
+use std::{
+    fs,
+    io::{self, Read},
+    path::Path,
+};
 
 pub const PROTOCOL_VERSION: u16 = 1;
 pub const FRAME_HEADER_LEN: usize = 4;
@@ -18,6 +23,25 @@ pub const ENCRYPTED_PAYLOAD_OVERHEAD: usize = 12 + 16;
 pub const MAX_MESSAGE_LIFETIME_SECS: u64 = 24 * 60 * 60;
 pub const MAX_FUTURE_SKEW_SECS: u64 = 5 * 60;
 pub const MAX_HOP_LIMIT: u8 = 8;
+
+pub(crate) fn read_bounded(path: &Path, max: usize) -> io::Result<Vec<u8>> {
+    let file = fs::File::open(path)?;
+    if file.metadata()?.len() > max as u64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "file exceeds maximum allowed size",
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.take(max as u64 + 1).read_to_end(&mut bytes)?;
+    if bytes.len() > max {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "file exceeds maximum allowed size",
+        ));
+    }
+    Ok(bytes)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProtocolError {

@@ -19,8 +19,9 @@ What if you could talk to you'r computer science geeks through the terminal ? Sa
 - `/open <peer>` shows the in-memory conversation with text delivery states. Valid signed receipts are the only way a message becomes acknowledged.
 - Optional local mDNS/DNS-SD discovery lists candidate peers in `/scan`, `/peers`, and the status line; it never auto-connects or auto-trusts.
 - A bounded replay cache suppresses duplicate or expired frames before they reach the timeline.
+- Resource ceilings in `config.toml` are validated and applied to connections, queues, write buffers, timeline state, and inbound frame rate.
 - An automated multi-peer TCP test covers connection, authentication, encrypted delivery, receipts, and replay rejection; CI runs formatting, linting, and tests.
-- Persistence, groups, relay services, and Bluetooth are still planned work.
+- Groups, relay services, mesh routing, and Bluetooth are still planned work.
 
 ## Run
 
@@ -32,7 +33,7 @@ cargo run -p ghost-terminal
 
 On first launch the terminal asks for a username and passphrase, then stores an encrypted identity under `~/.local/share/ghost/identity.ghost` (or `$XDG_DATA_HOME/ghost/identity.ghost`). Later launches ask for the passphrase to unlock it; no secret is printed.
 
-Inside the terminal, use `/help` for the built-in command list. `/quit`, Escape, or Ctrl-C exits cleanly. The listener defaults to `127.0.0.1:0`; set `GHOST_LISTEN` to choose another bind address or use `/listen <ip:port>`. Share the printed listening address with the other terminal, then use `/connect <ip:port>` and `/ping <ip:port>`. `/scan` lists mDNS/DNS-SD candidates; if multicast is blocked, manual connection still works.
+Inside the terminal, use `/help` for the built-in command list. `/quit`, Escape, or Ctrl-C exits cleanly. The listener defaults to `127.0.0.1:0`; set `GHOST_LISTEN` to choose another bind address, edit `config.toml` in the data directory, or use `/listen <ip:port>`. Share the printed listening address with the other terminal, then use `/connect <ip:port>` and `/ping <ip:port>`. `/scan` lists mDNS/DNS-SD candidates; if multicast is blocked, manual connection still works.
 
 | COMMAND | STATUS |
 | --- | --- |

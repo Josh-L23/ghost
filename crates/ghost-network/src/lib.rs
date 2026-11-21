@@ -2,8 +2,14 @@
 
 pub mod discovery;
 
-use ghost_core::protocol::{FRAME_HEADER_LEN, MAX_ENVELOPE_BYTES};
-use std::{collections::HashMap, fmt, net::SocketAddr, sync::Arc, time::Duration};
+use ghost_core::protocol::{FRAME_HEADER_LEN, MAX_ENVELOPE_BYTES, MAX_FRAME_BYTES};
+use std::{
+    collections::HashMap,
+    fmt,
+    net::SocketAddr,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{
@@ -21,9 +27,42 @@ use tokio::{
 pub const MAX_CONNECTIONS: usize = 8;
 pub const MAX_QUEUED_EVENTS: usize = 128;
 pub const MAX_QUEUED_COMMANDS: usize = 128;
+pub const MAX_WRITE_QUEUE: usize = 16;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
-const WRITE_QUEUE: usize = 16;
+const FRAME_BURST: u32 = 64;
+const FRAME_REFILL_PER_SEC: u64 = 32;
+const RATE_MAP_LIMIT: usize = 256;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NetworkLimits {
+    pub max_connections: usize,
+    pub max_command_queue: usize,
+    pub max_event_queue: usize,
+    pub max_write_queue: usize,
+}
+
+impl Default for NetworkLimits {
+    fn default() -> Self {
+        Self {
+            max_connections: MAX_CONNECTIONS,
+            max_command_queue: MAX_QUEUED_COMMANDS,
+            max_event_queue: MAX_QUEUED_EVENTS,
+            max_write_queue: MAX_WRITE_QUEUE,
+        }
+    }
+}
+
+impl NetworkLimits {
+    fn clamp(self) -> Self {
+        Self {
+            max_connections: self.max_connections.clamp(1, MAX_CONNECTIONS),
+            max_command_queue: self.max_command_queue.clamp(1, MAX_QUEUED_COMMANDS),
+            max_event_queue: self.max_event_queue.clamp(1, MAX_QUEUED_EVENTS),
+            max_write_queue: self.max_write_queue.clamp(1, MAX_WRITE_QUEUE),
+        }
+    }
+}
 
 #[derive(Debug)]
 pub enum NetworkError {
@@ -131,9 +170,17 @@ impl Drop for TransportHandle {
 }
 
 pub fn start(listen: SocketAddr) -> Result<TransportHandle, NetworkError> {
-    let (command_tx, command_rx) = mpsc::channel(MAX_QUEUED_COMMANDS);
-    let (event_tx, event_rx) = mpsc::channel(MAX_QUEUED_EVENTS);
-    let task = tokio::spawn(driver(listen, command_rx, event_tx));
+    start_with_limits(listen, NetworkLimits::default())
+}
+
+pub fn start_with_limits(
+    listen: SocketAddr,
+    limits: NetworkLimits,
+) -> Result<TransportHandle, NetworkError> {
+    let limits = limits.clamp();
+    let (command_tx, command_rx) = mpsc::channel(limits.max_command_queue);
+    let (event_tx, event_rx) = mpsc::channel(limits.max_event_queue);
+    let task = tokio::spawn(driver(listen, command_rx, event_tx, limits));
     Ok(TransportHandle {
         commands: command_tx,
         events: event_rx,
@@ -150,29 +197,94 @@ pub fn default_listen_addr() -> SocketAddr {
 
 type Writers = Arc<Mutex<HashMap<SocketAddr, mpsc::Sender<Vec<u8>>>>>;
 
+#[derive(Debug)]
+struct TokenBucket {
+    tokens: u32,
+    updated: Instant,
+}
+
+#[derive(Debug, Default)]
+struct FrameRateLimiter {
+    buckets: Mutex<HashMap<SocketAddr, TokenBucket>>,
+}
+
+impl FrameRateLimiter {
+    async fn allow(&self, peer: SocketAddr) -> bool {
+        let now = Instant::now();
+        let mut buckets = self.buckets.lock().await;
+        if !buckets.contains_key(&peer) && buckets.len() >= RATE_MAP_LIMIT {
+            buckets.clear();
+        }
+        let bucket = buckets.entry(peer).or_insert_with(|| TokenBucket {
+            tokens: FRAME_BURST,
+            updated: now,
+        });
+        let elapsed_ms = now.saturating_duration_since(bucket.updated).as_millis() as u64;
+        let refill = elapsed_ms * FRAME_REFILL_PER_SEC / 1_000;
+        bucket.tokens = bucket
+            .tokens
+            .saturating_add(refill.min(FRAME_BURST as u64) as u32)
+            .min(FRAME_BURST);
+        bucket.updated = now;
+        if bucket.tokens == 0 {
+            return false;
+        }
+        bucket.tokens -= 1;
+        true
+    }
+}
+
 async fn driver(
     listen: SocketAddr,
     mut commands: mpsc::Receiver<TransportCommand>,
     events: mpsc::Sender<TransportEvent>,
+    limits: NetworkLimits,
 ) {
+    let limits = limits.clamp();
     let writers: Writers = Arc::new(Mutex::new(HashMap::new()));
-    let permits = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+    let limiter = Arc::new(FrameRateLimiter::default());
+    let permits = Arc::new(Semaphore::new(limits.max_connections));
     let mut listener: Option<JoinHandle<()>> = None;
     let mut tasks: Vec<JoinHandle<()>> = Vec::new();
 
-    start_listener(listen, &events, &writers, &permits, &mut listener);
+    start_listener(
+        listen,
+        &events,
+        &writers,
+        &permits,
+        limits.max_write_queue,
+        &mut listener,
+    );
 
     while let Some(command) = commands.recv().await {
         match command {
             TransportCommand::Listen(address) => {
-                start_listener(address, &events, &writers, &permits, &mut listener);
+                start_listener(
+                    address,
+                    &events,
+                    &writers,
+                    &permits,
+                    limits.max_write_queue,
+                    &mut listener,
+                );
             }
             TransportCommand::Connect(peer) => {
                 let event_tx = events.clone();
                 let writers = writers.clone();
                 let permits = permits.clone();
+                let limiter = limiter.clone();
+                let write_queue = limits.max_write_queue;
                 tasks.push(tokio::spawn(async move {
-                    if let Err(error) = connect(peer, event_tx.clone(), writers, permits).await {
+                    if let Err(error) = connect(
+                        peer,
+                        event_tx.clone(),
+                        writers,
+                        permits,
+                        limiter,
+                        write_queue,
+                    )
+                    .await
+                    {
                         emit_error(&event_tx, peer, error);
                     }
                 }));
@@ -188,6 +300,16 @@ async fn driver(
                 }
             }
             TransportCommand::Send { peer, frame } => {
+                if frame.len() > MAX_FRAME_BYTES {
+                    emit(
+                        &events,
+                        TransportEvent::Error {
+                            peer: Some(peer),
+                            message: "frame exceeds maximum allowed size".into(),
+                        },
+                    );
+                    continue;
+                }
                 let writer = writers.lock().await.get(&peer).cloned();
                 match writer {
                     Some(writer) => {
@@ -227,6 +349,7 @@ fn start_listener(
     events: &mpsc::Sender<TransportEvent>,
     writers: &Writers,
     permits: &Arc<Semaphore>,
+    write_queue: usize,
     listener: &mut Option<JoinHandle<()>>,
 ) {
     if let Some(old) = listener.take() {
@@ -235,6 +358,7 @@ fn start_listener(
     let event_tx = events.clone();
     let writers = writers.clone();
     let permits = permits.clone();
+    let limiter = Arc::new(FrameRateLimiter::default());
     *listener = Some(tokio::spawn(async move {
         let bound = match TcpListener::bind(listen).await {
             Ok(bound) => bound,
@@ -303,7 +427,16 @@ fn start_listener(
                 continue;
             }
             emit(&event_tx, TransportEvent::Incoming(peer));
-            register_connection(stream, peer, permit, event_tx.clone(), writers.clone()).await;
+            register_connection(
+                stream,
+                peer,
+                permit,
+                event_tx.clone(),
+                writers.clone(),
+                limiter.clone(),
+                write_queue,
+            )
+            .await;
         }
     }));
 }
@@ -313,6 +446,8 @@ async fn connect(
     event_tx: mpsc::Sender<TransportEvent>,
     writers: Writers,
     permits: Arc<Semaphore>,
+    limiter: Arc<FrameRateLimiter>,
+    write_queue: usize,
 ) -> Result<(), NetworkError> {
     let permit = permits
         .clone()
@@ -325,7 +460,16 @@ async fn connect(
         .await
         .map_err(|_| NetworkError::Timeout)?
         .map_err(NetworkError::Io)?;
-    register_connection(stream, peer, permit, event_tx, writers).await;
+    register_connection(
+        stream,
+        peer,
+        permit,
+        event_tx,
+        writers,
+        limiter,
+        write_queue,
+    )
+    .await;
     Ok(())
 }
 
@@ -335,8 +479,10 @@ async fn register_connection(
     permit: OwnedSemaphorePermit,
     event_tx: mpsc::Sender<TransportEvent>,
     writers: Writers,
+    limiter: Arc<FrameRateLimiter>,
+    write_queue: usize,
 ) {
-    let (writer_tx, writer_rx) = mpsc::channel(WRITE_QUEUE);
+    let (writer_tx, writer_rx) = mpsc::channel(write_queue);
     {
         let mut writers = writers.lock().await;
         writers.insert(peer, writer_tx);
@@ -352,7 +498,7 @@ async fn register_connection(
     });
 
     tokio::spawn(async move {
-        reader_loop(reader, peer, &event_tx, &writers).await;
+        reader_loop(reader, peer, &event_tx, &writers, &limiter).await;
     });
 }
 
@@ -361,8 +507,20 @@ async fn reader_loop(
     peer: SocketAddr,
     events: &mpsc::Sender<TransportEvent>,
     writers: &Writers,
+    limiter: &FrameRateLimiter,
 ) {
     loop {
+        if !limiter.allow(peer).await {
+            emit(
+                events,
+                TransportEvent::Error {
+                    peer: Some(peer),
+                    message: "frame rate limit exceeded".into(),
+                },
+            );
+            cleanup(peer, "frame rate limit exceeded".into(), events, writers).await;
+            return;
+        }
         match timeout(IO_TIMEOUT, read_frame(&mut stream)).await {
             Ok(Ok(frame)) => emit(events, TransportEvent::Frame { peer, frame }),
             Ok(Err(error)) => {
@@ -547,6 +705,53 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(result, Err(NetworkError::FrameTooLarge(_))));
+    }
+
+    #[test]
+    fn limits_are_clamped_to_safe_ceilings() {
+        let limits = NetworkLimits {
+            max_connections: 1_000,
+            max_command_queue: 0,
+            max_event_queue: 4,
+            max_write_queue: 500,
+        }
+        .clamp();
+        assert_eq!(limits.max_connections, MAX_CONNECTIONS);
+        assert_eq!(limits.max_command_queue, 1);
+        assert_eq!(limits.max_event_queue, 4);
+        assert_eq!(limits.max_write_queue, MAX_WRITE_QUEUE);
+    }
+
+    #[tokio::test]
+    async fn frame_rate_limiter_bounds_bursts_and_refills() {
+        let limiter = FrameRateLimiter::default();
+        let peer: SocketAddr = "127.0.0.1:7000".parse().unwrap();
+        for _ in 0..FRAME_BURST {
+            assert!(limiter.allow(peer).await);
+        }
+        assert!(!limiter.allow(peer).await);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(limiter.allow(peer).await);
+    }
+
+    #[tokio::test]
+    async fn oversized_outbound_frame_is_rejected() {
+        let mut handle = start("127.0.0.1:0".parse().unwrap()).unwrap();
+        handle
+            .command(TransportCommand::Send {
+                peer: "127.0.0.1:7000".parse().unwrap(),
+                frame: vec![0; MAX_FRAME_BYTES + 1],
+            })
+            .unwrap();
+        let event = wait_for(&mut handle, |event| {
+            matches!(
+                event,
+                TransportEvent::Error { message, .. }
+                    if message == "frame exceeds maximum allowed size"
+            )
+        })
+        .await;
+        assert!(matches!(event, TransportEvent::Error { .. }));
     }
 
     #[tokio::test]

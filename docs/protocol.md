@@ -99,8 +99,10 @@ Trust records are local state, never received from a peer as proof. A record sto
 | Message lifetime | `1..=86,400` seconds |
 | Clock-skew tolerance | `created_at <= now + 300` seconds |
 | Expiry | `expires_at > now` |
+| Inner timestamps | Inner private/receipt `created_at` must equal the authenticated envelope timestamp |
 | Hops | `hop_count <= hop_limit <= 8` |
 | Identifiers and signature | Must be non-zero |
+| Local identity/config/trust files | Size checked before reading beyond their fixed ceilings |
 | Deduplication state | At most 256 message ids; oldest entries evicted first |
 | Encoding | No trailing bytes, known types only, bounded length-prefixed data |
 
@@ -119,6 +121,9 @@ The first adapter is manual TCP over a bounded command/event interface. The UI n
 | Connect timeout | 5 seconds |
 | Read/write timeout | 10 seconds |
 | Declared frame payload | 1 to 65,532 bytes; larger lengths rejected before payload allocation |
+| Inbound frame rate | Burst of 64 frames per peer, then 32 frames/second |
+| Configured limit ceilings | 8 connections, 128 commands, 128 events, 16 write frames; 10,000 history messages reserved for storage |
+| Timeline entries | At most 500 lines; oldest lines are discarded |
 
 A partial frame, empty frame, oversized declared length, timeout, or abrupt close produces a non-sensitive event and closes only that connection. A transport write is not proof of remote receipt or application processing.
 

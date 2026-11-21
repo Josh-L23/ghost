@@ -5,7 +5,7 @@ use std::{fmt, fs, path::PathBuf};
 
 use crate::{
     identity::{default_data_dir, fingerprint_from_public_key},
-    protocol::{BoundedBytes, IdentityId},
+    protocol::{BoundedBytes, IdentityId, read_bounded},
 };
 
 const MAGIC: &[u8; 8] = b"GHOSTTR1";
@@ -154,7 +154,7 @@ impl TrustStore {
             return Ok(store);
         }
         check_permissions(&store.path)?;
-        let bytes = fs::read(&store.path)?;
+        let bytes = read_bounded(&store.path, MAX_FILE_BYTES)?;
         let wrapped: BoundedBytes<MAX_FILE_BYTES> = postcard::from_bytes(&bytes)?;
         let (stored, remainder) = postcard::take_from_bytes::<StoredTrust>(wrapped.as_slice())?;
         if !remainder.is_empty() || &stored.magic != MAGIC {
@@ -528,6 +528,21 @@ mod tests {
         let path = dir.path().join("trust.ghost");
         fs::write(&path, b"not trust data").unwrap();
         assert!(TrustStore::load_or_empty(&path).is_err());
+    }
+
+    #[test]
+    fn oversized_trust_file_is_rejected_before_decoding() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("trust.ghost");
+        let mut store = TrustStore::new(&path);
+        store.observe(identity(9), "ada", 1).unwrap();
+        fs::write(&path, vec![0; MAX_FILE_BYTES + 1]).unwrap();
+
+        let error = match TrustStore::load_or_empty(&path) {
+            Ok(_) => panic!("oversized trust file was accepted"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("maximum allowed size"));
     }
 
     #[cfg(unix)]
