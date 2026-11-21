@@ -23,7 +23,9 @@ This is a learning project. It is not audited and makes no production-security o
 - A bounded replay cache suppresses duplicate or expired frames before they reach the timeline.
 - Resource ceilings in `config.toml` are validated and applied to connections, queues, write buffers, timeline state, and inbound frame rate.
 - An automated multi-peer TCP test covers connection, authentication, encrypted delivery, receipts, and replay rejection; CI runs formatting, linting, and tests.
-- Groups, relay services, mesh routing, and Bluetooth are still planned work.
+- `/group create|list|members|invite|send|remove` uses OpenMLS over authenticated sessions, with verified-peer requirements and bounded group control frames.
+- MLS group state is stored locally in a `0600` SQLite database using a JSON codec; it is not additionally encrypted by GHOST.
+- Relay services, mesh routing, and Bluetooth are still planned work.
 
 ## Run
 
@@ -40,10 +42,10 @@ Inside the terminal, use `/help` for the built-in command list. `/quit`, Escape,
 | COMMAND | STATUS |
 | --- | --- |
 | `/help`, `/whoami`, `/peers`, `/scan`, `/verify <peer> <fingerprint>`, `/block <peer>`, `/unblock <peer>`, `/listen <ip:port>`, `/connect <ip:port>`, `/disconnect <ip:port>`, `/ping <ip:port>`, `/msg <peer> <text>`, `/open <peer>`, `/clear`, `/ack`, `/quit` | Working in the terminal shell |
+| `/group create <name>`, `/group list`, `/group members <group>`, `/group invite <group> <peer>`, `/group send <group> <text>`, `/group remove <group> <peer>` | Working between verified peers over authenticated direct sessions |
 | `/history [peer\|group]`, `/relay status\|enable\|disable` | Parsed, but the backing service is not implemented |
-| `/group create\|invite\|send` | Planned; currently reported as not implemented |
 
-Message text must be entered with `/msg <peer> <text>`; bare text is not treated as a message yet. Activity lines redact message text; use `/open <peer>` to read a conversation. Security warnings stay visible until `/ack`.
+Message text must be entered with `/msg <peer> <text>` or `/group send <group> <text>`; bare text is not treated as a message yet. Activity lines redact message text; use `/open <peer>` or `/open <group>` to read a conversation or group timeline. Group history is in-memory only and group text is also redacted there. Security warnings stay visible until `/ack`.
 
 ## Workspace
 

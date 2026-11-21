@@ -184,6 +184,23 @@ impl Identity {
         okm
     }
 
+    pub fn signing_public_key_bytes(&self) -> [u8; 32] {
+        self.public_key.to_bytes()
+    }
+
+    pub fn mls_storage_key(&self) -> Zeroizing<[u8; 32]> {
+        use hkdf::Hkdf;
+        use sha2::Sha256;
+        let hk = Hkdf::<Sha256>::new(
+            Some(b"ghost-mls-storage-salt-v1"),
+            &self.signing_key.to_bytes(),
+        );
+        let mut okm = Zeroizing::new([0u8; 32]);
+        hk.expand(b"ghost-mls-storage-key-v1", &mut *okm)
+            .expect("32-byte HKDF output is valid");
+        okm
+    }
+
     pub fn transport_probe_frame(&self, note: &str) -> Result<Vec<u8>, ProtocolError> {
         let mut message_id = MessageId([0; 16]);
         OsRng.fill_bytes(&mut message_id.0);
@@ -209,6 +226,19 @@ impl Identity {
             authentication_data: self.sign(b"ghost-transport-probe"),
         };
         encode_frame(&envelope)
+    }
+}
+
+impl openmls_traits::signatures::Signer for Identity {
+    fn sign(&self, payload: &[u8]) -> Result<Vec<u8>, openmls_traits::signatures::SignerError> {
+        let signature: ed25519_dalek::Signature = <SigningKey as ed25519_dalek::Signer<
+            ed25519_dalek::Signature,
+        >>::sign(&self.signing_key, payload);
+        Ok(signature.to_bytes().to_vec())
+    }
+
+    fn signature_scheme(&self) -> openmls_traits::types::SignatureScheme {
+        openmls_traits::types::SignatureScheme::ED25519
     }
 }
 

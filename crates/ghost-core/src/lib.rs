@@ -9,6 +9,7 @@ pub mod dedup;
 pub mod delivery;
 pub mod event;
 pub mod fsutil;
+pub mod group;
 pub mod history;
 pub mod identity;
 pub mod messaging;

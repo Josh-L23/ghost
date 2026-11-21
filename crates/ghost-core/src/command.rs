@@ -21,6 +21,12 @@ pub enum Command {
     History(Option<String>),
     RelayStatus,
     RelaySetEnabled(bool),
+    GroupCreate(String),
+    GroupList,
+    GroupMembers(String),
+    GroupInvite { group: String, peer: String },
+    GroupSend { group: String, text: String },
+    GroupRemove { group: String, peer: String },
     Clear,
     Ack,
     Quit,
@@ -61,6 +67,10 @@ pub fn parse(input: &str) -> Result<Command, CommandError> {
         };
     }
 
+    if name == "group" {
+        return parse_group_command(args);
+    }
+
     match (name, args) {
         ("help", []) => Ok(Command::Help),
         ("whoami", []) => Ok(Command::WhoAmI),
@@ -98,12 +108,34 @@ pub fn parse(input: &str) -> Result<Command, CommandError> {
         ("clear", []) => Ok(Command::Clear),
         ("ack", []) => Ok(Command::Ack),
         ("quit", []) => Ok(Command::Quit),
-        ("group", _) => Err(CommandError(
-            "Group commands are planned but not implemented yet.".into(),
-        )),
         _ => Err(CommandError(
             "Unknown command or invalid arguments. Try /help.".into(),
         )),
+    }
+}
+
+fn parse_group_command(args: &[String]) -> Result<Command, CommandError> {
+    let usage = "Usage: /group create|list|members|invite|send|remove";
+    let Some(action) = args.first().map(String::as_str) else {
+        return Err(CommandError(usage.into()));
+    };
+    match (action, &args[1..]) {
+        ("create", [name]) => Ok(Command::GroupCreate(name.clone())),
+        ("list", []) => Ok(Command::GroupList),
+        ("members", [group]) => Ok(Command::GroupMembers(group.clone())),
+        ("invite", [group, peer]) => Ok(Command::GroupInvite {
+            group: group.clone(),
+            peer: peer.clone(),
+        }),
+        ("send", [group, rest @ ..]) if !rest.is_empty() => Ok(Command::GroupSend {
+            group: group.clone(),
+            text: rest.join(" "),
+        }),
+        ("remove", [group, peer]) => Ok(Command::GroupRemove {
+            group: group.clone(),
+            peer: peer.clone(),
+        }),
+        _ => Err(CommandError(usage.into())),
     }
 }
 
@@ -192,5 +224,40 @@ mod tests {
     #[test]
     fn parses_warning_acknowledgement() {
         assert_eq!(parse("/ack").unwrap(), Command::Ack);
+    }
+
+    #[test]
+    fn parses_group_commands() {
+        assert_eq!(
+            parse("/group create research").unwrap(),
+            Command::GroupCreate("research".into())
+        );
+        assert_eq!(parse("/group list").unwrap(), Command::GroupList);
+        assert_eq!(
+            parse("/group members research").unwrap(),
+            Command::GroupMembers("research".into())
+        );
+        assert_eq!(
+            parse("/group invite research ada").unwrap(),
+            Command::GroupInvite {
+                group: "research".into(),
+                peer: "ada".into(),
+            }
+        );
+        assert_eq!(
+            parse("/group send research hello group").unwrap(),
+            Command::GroupSend {
+                group: "research".into(),
+                text: "hello group".into(),
+            }
+        );
+        assert_eq!(
+            parse("/group remove research ada").unwrap(),
+            Command::GroupRemove {
+                group: "research".into(),
+                peer: "ada".into(),
+            }
+        );
+        assert!(parse("/group create").is_err());
     }
 }

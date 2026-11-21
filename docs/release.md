@@ -14,12 +14,14 @@ Today's build supports:
 - Authenticated ephemeral sessions with X25519 key agreement and ChaCha20-Poly1305 content encryption.
 - Direct encrypted messages with signed receipts, delivery state, and replay protection.
 - Bounded reconnect attempts for explicit `/connect` targets and fresh authentication on every reconnect.
+- MLS-backed group creation, invitation, membership listing, removal, and encrypted group messages over authenticated sessions with verified peers.
 - Safe startup behavior for corrupt config/trust files and documented recovery guidance.
 
 This build does **not** include:
 
-- Group messaging, relay forwarding, mesh routing, Bluetooth, or public-internet NAT traversal.
-- Persistent encrypted message history in the terminal; `/open` is in-memory only and `/history` is parsed but not backed by storage.
+- Relay forwarding, mesh routing, Bluetooth, or public-internet NAT traversal.
+- Persistent encrypted message history in the terminal; `/open` is in-memory only and `/history` is parsed but not backed by storage. Group timelines are also in-memory only.
+- Group store-and-forward, offline join/history backfill, or a periodic MLS update schedule.
 - Guaranteed delivery. A local write is `sent`, not `acknowledged`.
 - Anonymity, invisibility, traffic-analysis resistance, or protection from a compromised endpoint.
 - Verified Windows or macOS support. Linux is the first development target.
@@ -97,6 +99,34 @@ The following uses two local terminals, A and B. For two machines, replace the p
 
 If verification fails, confirm the full fingerprint character-for-character. A changed key for a known label is reported as a key change and must be resolved explicitly; it is never auto-trusted.
 
+## Group walkthrough
+
+Groups require a verified peer and an active authenticated session; group control frames are never sent to unverified peers.
+
+1. In terminal A, create a group and inspect it:
+
+   ```text
+   /group create research
+   /group list
+   /group members research
+   ```
+
+2. Invite the verified peer from the active session:
+
+   ```text
+   /group invite research <peer-label-or-fingerprint>
+   ```
+
+3. Terminal B receives the invitation and answers it over the authenticated session. Once the Welcome is processed, both peers have the same group id and `/group list` shows it.
+4. Either member sends an MLS-encrypted group message:
+
+   ```text
+   /group send research hello group
+   ```
+
+5. Use `/open research` to view the local in-memory group timeline. Activity lines and `/open` history redact group text; no group text is written to encrypted message-history storage.
+6. A current member can remove another member with `/group remove research <peer-label-or-fingerprint>`. Removed members are excluded from future epochs but retain copies they already received.
+
 ## Command status
 
 `/help` in the terminal is the source of truth for the implemented command language.
@@ -106,8 +136,8 @@ If verification fails, confirm the full fingerprint character-for-character. A c
 | `/help`, `/whoami`, `/peers`, `/scan`, `/verify <peer> <fingerprint>`, `/block <peer>`, `/unblock <peer>` | Working |
 | `/listen <ip:port>`, `/connect <ip:port>`, `/disconnect <ip:port>`, `/ping <ip:port>` | Working |
 | `/msg <peer> <text>`, `/open <peer>`, `/clear`, `/ack`, `/quit` | Working |
+| `/group create <name>`, `/group list`, `/group members <group>`, `/group invite <group> <peer>`, `/group send <group> <text>`, `/group remove <group> <peer>` | Working between verified peers over authenticated direct sessions |
 | `/history [peer\|group]`, `/relay status\|enable\|disable` | Parsed only; backing service not implemented |
-| `/group create\|invite\|send` | Planned; reported as not implemented |
 
 Peers may be selected by label, short fingerprint, full fingerprint, or connected address where the command parser accepts an address. Use full fingerprints when labels are ambiguous.
 
@@ -115,6 +145,8 @@ Peers may be selected by label, short fingerprint, full fingerprint, or connecte
 
 - Message text is entered with `/msg <peer> <text>`; bare text is not treated as a message.
 - Activity lines redact message text. Use `/open <peer>` for the in-memory conversation.
+- Group text is sent with `/group send <group> <text>` and encrypted with MLS epoch keys. Activity lines and `/open <group>` history redact group text; group history is in-memory only.
+- Group control and application frames require an authenticated session with a verified GHOST identity. An inner/outer group id mismatch is rejected before local state changes.
 - A transport write is `sent`; only a valid signed receipt becomes `acknowledged`. Pending entries expire locally.
 - Replay and duplicate frames are rejected by a bounded deduplication cache before they reach the timeline.
 - History settings and encrypted history storage are implemented in `ghost-core` and covered by tests, but the terminal does not yet open that database. `/history` is not a working command.
@@ -137,8 +169,9 @@ The detailed threat model is in [protocol.md](protocol.md). The conservative sum
 | --- | --- |
 | Passive observer | Content is encrypted, but endpoints, timing, and sizes remain visible. |
 | Impersonating peer | Ed25519 signatures plus out-of-band full-fingerprint verification; no silent key acceptance. |
-| Malicious relay | End-to-end encryption would keep content opaque, but relay forwarding is not implemented. |
-| Replay or duplicate frames | Unique IDs, expiry, and bounded deduplication. |
+| Unauthorized group member | OpenMLS credentials bound to verified GHOST identities, Welcome-only joins, epoch validation, and membership-change commits. |
+| Malicious relay | Direct and group payloads remain opaque to relays; relay forwarding is not implemented. |
+| Replay or duplicate frames | Unique IDs, expiry, bounded deduplication, and MLS epoch validation for groups. |
 | Compromised endpoint | Keys are protected at rest and never logged, but plaintext after decryption can still be exposed. |
 | Denial of service | Bounded frames, payloads, queues, connections, parsing, timeline, and inbound frame rate. |
 | Anonymity | Not provided. No traffic-analysis resistance or invisibility claim. |
@@ -147,7 +180,7 @@ The detailed threat model is in [protocol.md](protocol.md). The conservative sum
 
 ## Reviewed protocol and cryptographic decisions
 
-[protocol.md](protocol.md) records the wire envelope, signed hello, session transcript, validation limits, and library choices. The current choices are maintained libraries and reviewed constructions: Ed25519 identities, X25519 ephemeral key agreement, HKDF-SHA256, ChaCha20-Poly1305, Argon2id for identity-at-rest protection, OS randomness, and zeroizing secret buffers where the type system permits. GHOST does not invent cryptographic primitives or formats.
+[protocol.md](protocol.md) records the v2 wire envelope, signed hello, session transcript, validation limits, and library choices. The current choices are maintained libraries and reviewed constructions: Ed25519 identities, X25519 ephemeral key agreement, HKDF-SHA256, ChaCha20-Poly1305, OpenMLS/RFC 9420 for group key management, Argon2id for identity-at-rest protection, OS randomness, and zeroizing secret buffers where the type system permits. GHOST does not invent cryptographic primitives or formats. MLS state is persisted with a JSON SQLite codec under Unix mode `0600` and is not additionally encrypted by GHOST.
 
 Exact dependency versions are pinned by the workspace manifests and reviewed again before any broader release.
 
@@ -158,10 +191,10 @@ Exact dependency versions are pinned by the workspace manifests and reviewed aga
 | New user can create identity, view fingerprint, verify a peer out-of-band, and connect manually | Met for the local TCP milestone. |
 | Two authenticated peers exchange encrypted messages with receipts and deduplication | Met for direct messages. |
 | Message history can be disabled, viewed, and cleared; stored bodies are encrypted | Partially met in `ghost-core`; not exposed by the terminal. |
-| Groups follow a reviewed membership and key-management design | Not implemented; MLS evaluation remains open. |
+| Groups follow a reviewed membership and key-management design | Met for direct, verified-peer group messaging using OpenMLS/RFC 9420. Relay, store-and-forward, periodic updates, and explicit group-size limits remain out of scope. |
 | Relays are off by default and explicitly authorized | Not implemented. |
 | Crypto decisions are reviewed and recorded | Documented in `protocol.md`; no external audit. |
-| No secrets or plaintext in logs/config/unencrypted storage | Enforced and tested in the implemented paths. |
+| No secrets or plaintext in logs/config/unencrypted storage | Enforced and tested for identity, history, and direct-message paths. MLS epoch state is stored in a `0600` JSON SQLite database and is not additionally encrypted by GHOST. |
 | Unverified peers never silently accepted | Enforced in session establishment. |
 | Resource limits cover implemented surfaces | Enforced and tested. |
 | UI responsive and terminal restored on exit/error | Implemented for the current shell. |
@@ -172,7 +205,7 @@ This is therefore a documented development milestone, not a complete implementat
 
 ## Known risks and open decisions
 
-- Group key management requires a reviewed protocol before group messaging is implemented. The design decision is recorded in [group-security.md](group-security.md).
+- Group key management uses the reviewed design recorded in [group-security.md](group-security.md). GHOST has no professional audit; MLS state is protected only by filesystem permissions at rest, and removed members retain copies they already received.
 - Relay scope, expiry, revocation propagation, and forwarding limits need explicit design before enabling forwarding.
 - Store-and-forward retains encrypted envelopes and privacy obligations; it is out of scope and offline delivery fails.
 - Bluetooth needs platform adapters, permissions, and BLE/Classic decisions; it is not supported yet.

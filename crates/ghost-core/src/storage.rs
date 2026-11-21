@@ -17,11 +17,11 @@ use crate::{
     fsutil,
     history::{self, EncryptedHistoryRecord},
     identity,
-    protocol::{IdentityId, MessageId, MessageType},
+    protocol::{GroupName, IdentityId, MessageId, MessageType},
     trust::{TrustRecord, TrustState},
 };
 
-const SCHEMA_VERSION: i32 = 3;
+const SCHEMA_VERSION: i32 = 4;
 const MAX_PENDING: usize = 32;
 const MAX_DEDUP: usize = dedup::MAX_DEDUP_ENTRIES;
 
@@ -98,6 +98,15 @@ pub struct PendingRecord {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GroupMetadata {
+    pub group_id: [u8; 32],
+    pub name: GroupName,
+    pub creator: IdentityId,
+    pub created_at: u64,
+    pub epoch: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GroupMember {
     pub group_id: [u8; 32],
     pub member_id: IdentityId,
@@ -169,6 +178,10 @@ impl Storage {
         }
         if version == 2 {
             self.migrate_to_v3()?;
+            version = 3;
+        }
+        if version == 3 {
+            self.migrate_to_v4()?;
         }
         Ok(())
     }
@@ -261,6 +274,26 @@ impl Storage {
             );
             INSERT OR IGNORE INTO history_settings (id, enabled, retention_max_messages)
                 VALUES (1, 1, 500);
+            ",
+        )?;
+        tx.pragma_update(None, "user_version", 3)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn migrate_to_v4(&mut self) -> Result<(), StorageError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS group_metadata (
+                group_id BLOB PRIMARY KEY CHECK (length(group_id) = 32),
+                name BLOB NOT NULL,
+                creator BLOB NOT NULL CHECK (length(creator) = 32),
+                created_at INTEGER NOT NULL,
+                epoch INTEGER NOT NULL
+            );
             ",
         )?;
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -400,6 +433,96 @@ impl Storage {
             });
         }
         Ok(out)
+    }
+
+    pub fn upsert_group_metadata(&mut self, metadata: &GroupMetadata) -> Result<(), StorageError> {
+        self.conn.execute(
+            "INSERT INTO group_metadata (group_id, name, creator, created_at, epoch)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(group_id) DO UPDATE SET
+                name=excluded.name,
+                creator=excluded.creator,
+                created_at=excluded.created_at,
+                epoch=excluded.epoch",
+            params![
+                metadata.group_id.as_slice(),
+                metadata.name.as_slice(),
+                metadata.creator.0.as_slice(),
+                metadata.created_at as i64,
+                metadata.epoch as i64,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn load_group_metadata(
+        &self,
+        group_id: &[u8; 32],
+    ) -> Result<Option<GroupMetadata>, StorageError> {
+        self.conn
+            .query_row(
+                "SELECT group_id, name, creator, created_at, epoch FROM group_metadata WHERE group_id = ?1",
+                params![group_id.as_slice()],
+                |row| {
+                    let group_id: Vec<u8> = row.get(0)?;
+                    let name: Vec<u8> = row.get(1)?;
+                    let creator: Vec<u8> = row.get(2)?;
+                    let created_at: i64 = row.get(3)?;
+                    let epoch: i64 = row.get(4)?;
+                    Ok((group_id, name, creator, created_at, epoch))
+                },
+            )
+            .optional()?
+            .map(|(id, name, creator, created_at, epoch)| {
+                Ok(GroupMetadata {
+                    group_id: bytes_to_id32(&id)?,
+                    name: GroupName::new(name)
+                        .map_err(|_| StorageError::Corrupt("invalid group name".into()))?,
+                    creator: IdentityId(bytes_to_id32(&creator)?),
+                    created_at: created_at as u64,
+                    epoch: epoch as u64,
+                })
+            })
+            .transpose()
+    }
+
+    pub fn list_group_metadata(&self) -> Result<Vec<GroupMetadata>, StorageError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT group_id, name, creator, created_at, epoch FROM group_metadata")?;
+        let rows = stmt.query_map([], |row| {
+            let group_id: Vec<u8> = row.get(0)?;
+            let name: Vec<u8> = row.get(1)?;
+            let creator: Vec<u8> = row.get(2)?;
+            let created_at: i64 = row.get(3)?;
+            let epoch: i64 = row.get(4)?;
+            Ok((group_id, name, creator, created_at, epoch))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, name, creator, created_at, epoch) = row?;
+            out.push(GroupMetadata {
+                group_id: bytes_to_id32(&id)?,
+                name: GroupName::new(name)
+                    .map_err(|_| StorageError::Corrupt("invalid group name".into()))?,
+                creator: IdentityId(bytes_to_id32(&creator)?),
+                created_at: created_at as u64,
+                epoch: epoch as u64,
+            });
+        }
+        Ok(out)
+    }
+
+    pub fn delete_group_member(
+        &mut self,
+        group_id: &[u8; 32],
+        member_id: &IdentityId,
+    ) -> Result<(), StorageError> {
+        self.conn.execute(
+            "DELETE FROM group_members WHERE group_id = ?1 AND member_id = ?2",
+            params![group_id.as_slice(), member_id.0.as_slice()],
+        )?;
+        Ok(())
     }
 
     pub fn upsert_pending(&mut self, record: &PendingRecord) -> Result<(), StorageError> {

@@ -1,6 +1,6 @@
 //! Versioned wire envelope and bounded validation rules.
 //!
-//! These types describe the GHOST v1 wire format. They do not implement
+//! These types describe the GHOST v2 wire format. They do not implement
 //! cryptography; cryptographic constructions are specified in `docs/protocol.md`.
 
 use serde::{
@@ -14,12 +14,15 @@ use std::{
     path::Path,
 };
 
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 pub const FRAME_HEADER_LEN: usize = 4;
 pub const MAX_FRAME_BYTES: usize = 64 * 1024;
 pub const MAX_ENVELOPE_BYTES: usize = MAX_FRAME_BYTES - FRAME_HEADER_LEN;
-pub const MAX_ENCRYPTED_PAYLOAD_BYTES: usize = 16 * 1024;
+pub const MAX_ENCRYPTED_PAYLOAD_BYTES: usize = 32 * 1024;
 pub const ENCRYPTED_PAYLOAD_OVERHEAD: usize = 12 + 16;
+pub const MAX_GROUP_NAME_BYTES: usize = 64;
+pub const MAX_GROUP_TEXT_BYTES: usize = 4096;
+pub const MAX_MLS_MESSAGE_BYTES: usize = 28 * 1024;
 pub const MAX_MESSAGE_LIFETIME_SECS: u64 = 24 * 60 * 60;
 pub const MAX_FUTURE_SKEW_SECS: u64 = 5 * 60;
 pub const MAX_HOP_LIMIT: u8 = 8;
@@ -204,9 +207,10 @@ impl MessageType {
     pub const GROUP: Self = Self(2);
     pub const RECEIPT: Self = Self(3);
     pub const CONTROL: Self = Self(4);
+    pub const GROUP_CONTROL: Self = Self(5);
 
     pub fn is_known(self) -> bool {
-        matches!(self.0, 1..=4)
+        matches!(self.0, 1..=5)
     }
 }
 
@@ -294,6 +298,34 @@ impl<'de, const N: usize> Deserialize<'de> for BoundedBytes<N> {
 }
 
 pub type EncryptedPayload = BoundedBytes<MAX_ENCRYPTED_PAYLOAD_BYTES>;
+pub type GroupName = BoundedBytes<MAX_GROUP_NAME_BYTES>;
+pub type MlsMessageBytes = BoundedBytes<MAX_MLS_MESSAGE_BYTES>;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GroupWireMessage {
+    KeyPackageRequest {
+        group_id: GroupId,
+        group_name: GroupName,
+    },
+    KeyPackage {
+        group_id: GroupId,
+        key_package: MlsMessageBytes,
+    },
+    Join {
+        group_id: GroupId,
+        group_name: GroupName,
+        welcome: MlsMessageBytes,
+    },
+    Commit {
+        group_id: GroupId,
+        commit: MlsMessageBytes,
+    },
+    Application {
+        group_id: GroupId,
+        epoch: u64,
+        message: MlsMessageBytes,
+    },
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Envelope {
@@ -494,10 +526,10 @@ mod tests {
     #[test]
     fn validates_required_fields() {
         let mut envelope = sample();
-        envelope.protocol_version = 2;
+        envelope.protocol_version = 3;
         assert_eq!(
             validate(&envelope, NOW),
-            Err(ProtocolError::UnsupportedVersion(2))
+            Err(ProtocolError::UnsupportedVersion(3))
         );
 
         let mut envelope = sample();
@@ -577,6 +609,10 @@ mod tests {
         assert_eq!(
             postcard::to_allocvec(&MessageType::CONTROL).unwrap(),
             vec![4]
+        );
+        assert_eq!(
+            postcard::to_allocvec(&MessageType::GROUP_CONTROL).unwrap(),
+            vec![5]
         );
     }
 }
