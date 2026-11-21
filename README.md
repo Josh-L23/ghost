@@ -37,11 +37,11 @@ Inside the terminal, use `/help` for the built-in command list. `/quit`, Escape,
 
 | COMMAND | STATUS |
 | --- | --- |
-| `/help`, `/whoami`, `/peers`, `/scan`, `/verify <peer> <fingerprint>`, `/block <peer>`, `/unblock <peer>`, `/listen <ip:port>`, `/connect <ip:port>`, `/disconnect <ip:port>`, `/ping <ip:port>`, `/msg <peer> <text>`, `/open <peer>`, `/clear`, `/quit` | Working in the terminal shell |
+| `/help`, `/whoami`, `/peers`, `/scan`, `/verify <peer> <fingerprint>`, `/block <peer>`, `/unblock <peer>`, `/listen <ip:port>`, `/connect <ip:port>`, `/disconnect <ip:port>`, `/ping <ip:port>`, `/msg <peer> <text>`, `/open <peer>`, `/clear`, `/ack`, `/quit` | Working in the terminal shell |
 | `/history [peer\|group]`, `/relay status\|enable\|disable` | Parsed, but the backing service is not implemented |
 | `/group create\|invite\|send` | Planned; currently reported as not implemented |
 
-Message text must be entered with `/msg <peer> <text>`; bare text is not treated as a message yet.
+Message text must be entered with `/msg <peer> <text>`; bare text is not treated as a message yet. Activity lines redact message text; use `/open <peer>` to read a conversation. Security warnings stay visible until `/ack`.
 
 ## Workspace
 

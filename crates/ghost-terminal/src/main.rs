@@ -7,6 +7,7 @@ use std::{
 };
 
 use crossterm::{
+    cursor::Show,
     event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -39,11 +40,14 @@ use zeroize::Zeroizing;
 
 const RECEIPT_TIMEOUT_SECS: u64 = 60;
 const MAX_TIMELINE_LINES: usize = 500;
+const MAX_SAFE_TEXT: usize = 512;
+const MAX_SAFE_LABEL: usize = 64;
 const MAX_CONNECTION_ENTRIES: usize = MAX_CONNECTIONS * 2;
 
 struct App {
     input: String,
     lines: Vec<String>,
+    warnings: Vec<String>,
     should_quit: bool,
     identity_label: String,
     fingerprint_short: String,
@@ -74,6 +78,7 @@ impl App {
         let mut app = Self {
             input: String::new(),
             lines: Vec::new(),
+            warnings: Vec::new(),
             should_quit: false,
             identity_label: identity.username().to_owned(),
             fingerprint_short: fingerprint.short(),
@@ -124,25 +129,39 @@ impl App {
         }
     }
 
+    fn warn(&mut self, message: String) {
+        let warning = format!("[WARNING] {}", sanitize_display(&message, MAX_SAFE_TEXT));
+        if !self.warnings.contains(&warning) {
+            self.warnings.push(warning.clone());
+        }
+        self.push_line(warning);
+    }
+
+    fn acknowledge_warnings(&mut self) {
+        self.warnings.clear();
+        self.push_line("Warnings acknowledged.".into());
+    }
+
     fn handle_input(&mut self) {
         let input = std::mem::take(&mut self.input);
         if input.trim().is_empty() {
             return;
         }
-        self.push_line(format!("› {input}"));
+        self.push_line(redact_command_input(&input));
         match command::parse(&input) {
             Ok(Command::Help) => self.extend_lines([
                 "Commands: /help /whoami /peers /verify <peer> <fingerprint>".into(),
                 "          /block <peer> /unblock <peer> /scan /listen <ip:port>".into(),
                 "          /connect <ip:port> /disconnect <ip:port> /ping <ip:port>".into(),
                 "          /msg <peer> <text> /open <peer> /history [peer|group]".into(),
-                "          /relay status|enable|disable /clear /quit".into(),
+                "          /relay status|enable|disable /clear /ack /quit".into(),
                 "/whoami shows your username and identity fingerprint.".into(),
                 "Peers may be selected by label, short fingerprint, or full fingerprint.".into(),
                 "TCP is manual-only; sessions require verified peer fingerprints.".into(),
                 "/scan is optional; mDNS may be blocked, so /connect <ip:port> always works.".into(),
                 "Discovered peers are never trusted or contacted without your approval.".into(),
                 "Delivery indicators are text; a transport write is not a receipt.".into(),
+                "Security warnings stay visible until /ack; message text is never echoed in activity logs.".into(),
                 "Message history is in-memory only; storage and relay services are not implemented yet.".into(),
             ]),
             Ok(Command::WhoAmI) => {
@@ -312,10 +331,7 @@ impl App {
                         };
                         let _ = self.deliveries.set_state(&message_id, state);
                         self.set_message_state(&message_id, state);
-                        self.push_line(format!(
-                            "[MSG] to {label}: {text} [{}]",
-                            state.label()
-                        ));
+                        self.push_line(describe_message_event("to", &label, state));
                     }
                     Some(Err(error)) => self.push_line(format!("Message failed: {error}")),
                     None => self.push_line(format!("No session for peer '{peer}'.")),
@@ -337,13 +353,14 @@ impl App {
                         let label = self.peer_label(&tracked.message.sender);
                         self.push_line(format!(
                             "  [{direction}] {label}: {} [{}]",
-                            tracked.message.text,
+                            sanitize_display(&tracked.message.text, MAX_SAFE_TEXT),
                             tracked.state.label()
                         ));
                     }
                 }
             }
             Ok(Command::Clear) => self.lines.clear(),
+            Ok(Command::Ack) => self.acknowledge_warnings(),
             Ok(Command::Quit) => self.should_quit = true,
             Ok(_) => self
                 .lines
@@ -386,7 +403,7 @@ impl App {
                 TransportEvent::Frame { peer, frame } => self.handle_session_frame(peer, frame),
                 TransportEvent::Error { peer, message } => {
                     let peer = peer.map(|peer| peer.to_string()).unwrap_or_default();
-                    self.push_line(format!("[NETWORK] {peer} {message}"));
+                    self.warn(format!("Network: {peer} {message}"));
                 }
             }
         }
@@ -427,7 +444,7 @@ impl App {
                         self.extend_lines(descriptions);
                     }
                 }
-                DiscoveryEvent::Error(message) => self.push_line(format!("[DISCOVERY] {message}")),
+                DiscoveryEvent::Error(message) => self.warn(format!("Discovery: {message}")),
             }
         }
     }
@@ -465,7 +482,7 @@ impl App {
                 self.push_line(format!("[SESSION] Authentication started with {peer}."));
             }
             Err(error) => {
-                self.push_line(format!("[SESSION] Could not start authentication: {error}"));
+                self.warn(format!("Authentication failed: {error}"));
             }
         }
     }
@@ -476,14 +493,14 @@ impl App {
                 Ok(session) => {
                     self.push_line(format!(
                         "[SESSION] Verified {} ({}) with fingerprint {}.",
-                        session.peer_label(),
+                        sanitize_display(session.peer_label(), MAX_SAFE_LABEL),
                         session.peer_id(),
                         session::fingerprint_of(&session.peer_id())
                     ));
                     self.sessions.insert(peer, session);
                 }
                 Err(error) => {
-                    self.push_line(format!("[SESSION] Refused {peer}: {error}"));
+                    self.warn(format!("Session refused from {peer}: {error}"));
                     self.send_command(TransportCommand::Disconnect(peer));
                 }
             }
@@ -493,8 +510,8 @@ impl App {
         let decrypted = match self.sessions.get_mut(&peer) {
             Some(session) => session.decrypt(&frame, now()),
             None => {
-                self.push_line(format!(
-                    "[SESSION] Unexpected frame from {peer} before authentication."
+                self.warn(format!(
+                    "Unexpected frame from {peer} before authentication."
                 ));
                 return;
             }
@@ -509,7 +526,7 @@ impl App {
             ) {
                 Ok(()) => Ok(frame),
                 Err(error) => {
-                    self.push_line(format!("[SESSION] Ignored replayed frame: {error}"));
+                    self.warn(format!("Ignored replayed frame: {error}"));
                     return;
                 }
             },
@@ -517,8 +534,7 @@ impl App {
         };
         match decrypted {
             Ok(decrypted) if decrypted.message_type == MessageType::CONTROL => {
-                let plaintext = String::from_utf8_lossy(&decrypted.plaintext);
-                self.push_line(format!("[PING] {peer}: {plaintext}"));
+                self.push_line(describe_control_event(peer, decrypted.plaintext.len()));
             }
             Ok(decrypted) if decrypted.message_type == MessageType::RECEIPT => {
                 let opened = match self.sessions.get(&peer) {
@@ -540,9 +556,7 @@ impl App {
                         }
                         Err(_) => self.push_line("[STATE] Ignored unknown receipt.".into()),
                     },
-                    Err(error) => self
-                        .lines
-                        .push(format!("[STATE] Rejected receipt: {error}")),
+                    Err(error) => self.warn(format!("Rejected receipt: {error}")),
                 }
             }
             Ok(decrypted) => {
@@ -554,7 +568,11 @@ impl App {
                     Ok(message) => {
                         let label = self.peer_label(&message.sender);
                         let message_id = message.message_id;
-                        self.push_line(format!("[MSG] {label}: {}", message.text));
+                        self.push_line(describe_message_event(
+                            "from",
+                            &label,
+                            DeliveryState::Received,
+                        ));
                         self.record_message(message, DeliveryState::Received);
                         let receipt = self.sessions.get_mut(&peer).map(|session| {
                             messaging::compose_receipt(session, &self.identity, message_id, now())
@@ -563,18 +581,14 @@ impl App {
                             Some(Ok((_, frame))) => {
                                 let _ = self.send_command(TransportCommand::Send { peer, frame });
                             }
-                            Some(Err(error)) => {
-                                self.push_line(format!("[STATE] Receipt failed: {error}"))
-                            }
+                            Some(Err(error)) => self.warn(format!("Receipt failed: {error}")),
                             None => {}
                         }
                     }
-                    Err(error) => self.push_line(format!("[MSG] Rejected frame: {error}")),
+                    Err(error) => self.warn(format!("Rejected frame: {error}")),
                 }
             }
-            Err(error) => self
-                .lines
-                .push(format!("[SESSION] Rejected frame from {peer}: {error}")),
+            Err(error) => self.warn(format!("Rejected frame from {peer}: {error}")),
         }
     }
 
@@ -614,12 +628,12 @@ impl App {
     fn peer_label(&self, id: &IdentityId) -> String {
         for session in self.sessions.values() {
             if session.peer_id() == *id {
-                return session.peer_label().to_owned();
+                return sanitize_display(session.peer_label(), MAX_SAFE_LABEL);
             }
         }
         for record in self.trust.records() {
             if record.identity_id == *id {
-                return record.label().to_owned();
+                return sanitize_display(record.label(), MAX_SAFE_LABEL);
             }
         }
         session::fingerprint_of(id)
@@ -702,7 +716,7 @@ impl App {
         match self.transport.command(command) {
             Ok(()) => true,
             Err(error) => {
-                self.push_line(format!("Transport error: {error}"));
+                self.warn(format!("Transport error: {error}"));
                 false
             }
         }
@@ -718,7 +732,7 @@ fn describe_record(record: &TrustRecord) -> String {
     format!(
         "[{}] {} fp={} id={} —{}",
         record.state.label(),
-        record.label(),
+        sanitize_display(record.label(), MAX_SAFE_LABEL),
         record.short_fingerprint(),
         record.identity_id,
         note
@@ -732,6 +746,50 @@ fn describe_discovered(peer: &DiscoveredPeer, trust_state: &str) -> String {
     )
 }
 
+fn sanitize_display(input: &str, max: usize) -> String {
+    let mut output = String::new();
+    for (index, ch) in input.chars().enumerate() {
+        if index >= max {
+            break;
+        }
+        if ch.is_control() {
+            output.push('?');
+        } else {
+            output.push(ch);
+        }
+    }
+    output
+}
+
+fn redact_command_input(input: &str) -> String {
+    let trimmed = input.trim();
+    if trimmed.to_ascii_lowercase().starts_with("/msg") {
+        let peer = trimmed
+            .get(4..)
+            .unwrap_or_default()
+            .split_whitespace()
+            .next()
+            .unwrap_or_default();
+        return format!(
+            "› /msg {} [text redacted]",
+            sanitize_display(peer, MAX_SAFE_LABEL)
+        );
+    }
+    format!("› {}", sanitize_display(trimmed, MAX_SAFE_TEXT))
+}
+
+fn describe_message_event(direction: &str, label: &str, state: DeliveryState) -> String {
+    format!(
+        "[MSG] {direction} {}: [text redacted] [{}]",
+        sanitize_display(label, MAX_SAFE_LABEL),
+        state.label()
+    )
+}
+
+fn describe_control_event(peer: SocketAddr, payload_len: usize) -> String {
+    format!("[PING] {peer}: control probe acknowledged ({payload_len} bytes)")
+}
+
 fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -741,17 +799,29 @@ fn now() -> u64 {
 
 fn main() -> Result<(), Box<dyn Error>> {
     enable_raw_mode()?;
+    let mut guard = TerminalGuard {
+        entered_alternate_screen: false,
+    };
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
+    guard.entered_alternate_screen = true;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
     let result = run(&mut terminal);
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
-    result?;
-    Ok(())
+    drop(terminal);
+    drop(guard);
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            if let Some(io_error) = error.downcast_ref::<io::Error>() {
+                if io_error.kind() == io::ErrorKind::Interrupted {
+                    return Ok(());
+                }
+            }
+            Err(error)
+        }
+    }
 }
 
 fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<(), Box<dyn Error>> {
@@ -808,10 +878,16 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<(), Box<
 }
 
 fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
+    let warning_height = if app.warnings.is_empty() {
+        0
+    } else {
+        (app.warnings.len() + 2).min(8) as u16
+    };
     let areas = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
+            Constraint::Length(warning_height),
             Constraint::Min(5),
             Constraint::Length(3),
             Constraint::Length(1),
@@ -835,6 +911,34 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
     .block(Block::default().borders(Borders::BOTTOM));
     frame.render_widget(header, areas[0]);
 
+    if !app.warnings.is_empty() {
+        let style = Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD);
+        let visible = warning_height.saturating_sub(2) as usize;
+        let mut warning_lines: Vec<Line<'static>> = app
+            .warnings
+            .iter()
+            .take(visible)
+            .map(|warning| Line::from(Span::styled(warning.clone(), style)))
+            .collect();
+        if app.warnings.len() > visible {
+            warning_lines.push(Line::from(Span::styled(
+                format!(
+                    "+{} more active; /ack to dismiss",
+                    app.warnings.len() - visible
+                ),
+                style,
+            )));
+        } else {
+            warning_lines.push(Line::from(Span::styled("/ack to dismiss", style)));
+        }
+        let warning = Paragraph::new(warning_lines)
+            .block(Block::default().title(" Warnings ").borders(Borders::ALL))
+            .wrap(Wrap { trim: false });
+        frame.render_widget(warning, areas[1]);
+    }
+
     let body: Vec<Line<'_>> = app
         .lines
         .iter()
@@ -843,11 +947,11 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
     let timeline = Paragraph::new(body)
         .block(Block::default().title(" Activity ").borders(Borders::ALL))
         .wrap(Wrap { trim: false });
-    frame.render_widget(timeline, areas[1]);
+    frame.render_widget(timeline, areas[2]);
 
     let input = Paragraph::new(format!("› {}", app.input))
         .block(Block::default().title(" Command ").borders(Borders::ALL));
-    frame.render_widget(input, areas[2]);
+    frame.render_widget(input, areas[3]);
 
     let verified = app
         .trust
@@ -860,22 +964,47 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
         .iter()
         .filter(|(_, state)| *state == ConnectionState::Connected)
         .count();
-    frame.render_widget(
-        Paragraph::new(format!(
-            "Identity: {} ({})  |  Links: {} ({} sessions)  |  Known: {} ({} verified)  |  Discovered: {}  |  Ctrl-C: quit",
+    let status = if frame.area().width >= 110 {
+        format!(
+            "Identity: {} ({})  |  Links: {} ({} sessions)  |  Known: {} ({} verified)  |  Discovered: {}  |  Warnings: {}  |  Ctrl-C: quit",
             app.identity_label,
             app.fingerprint_short,
             connected,
             app.sessions.len(),
             app.trust.records().len(),
             verified,
-            app.discovered.len()
-        )),
-        areas[3],
-    );
+            app.discovered.len(),
+            app.warnings.len()
+        )
+    } else {
+        format!(
+            "{} | L{} S{} K{} D{} W{} | /help",
+            app.fingerprint_short,
+            connected,
+            app.sessions.len(),
+            app.trust.records().len(),
+            app.discovered.len(),
+            app.warnings.len()
+        )
+    };
+    frame.render_widget(Paragraph::new(status), areas[4]);
 }
 
 type AppTerminal = Terminal<CrosstermBackend<io::Stdout>>;
+
+struct TerminalGuard {
+    entered_alternate_screen: bool,
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+        if self.entered_alternate_screen {
+            let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        }
+        let _ = execute!(io::stdout(), Show);
+    }
+}
 
 fn setup_identity(terminal: &mut AppTerminal) -> Result<Identity, Box<dyn Error>> {
     let store = IdentityStore::new(identity::default_identity_path()?);
@@ -891,18 +1020,14 @@ fn setup_identity(terminal: &mut AppTerminal) -> Result<Identity, Box<dyn Error>
             continue;
         }
 
-        let passphrase = Zeroizing::new(prompt(
-            terminal,
-            "Passphrase",
-            "At least 8 characters. It is never displayed or logged.",
-            true,
-        )?);
+        notice = "At least 8 characters. It is never displayed or logged.".into();
+        let passphrase = prompt(terminal, "Passphrase", &notice, true)?;
         if !identity::is_valid_passphrase(passphrase.as_bytes()) {
             notice = "Passphrase must be at least 8 characters.".into();
             continue;
         }
 
-        let confirmation = Zeroizing::new(prompt(terminal, "Repeat passphrase", &notice, true)?);
+        let confirmation = prompt(terminal, "Repeat passphrase", &notice, true)?;
         if passphrase.as_str() != confirmation.as_str() {
             notice = "Passphrases did not match. Try again.".into();
             continue;
@@ -922,7 +1047,7 @@ fn unlock_identity(
 ) -> Result<Identity, Box<dyn Error>> {
     let mut notice = "Unlock your local identity.".to_owned();
     loop {
-        let passphrase = Zeroizing::new(prompt(terminal, "Passphrase", &notice, true)?);
+        let passphrase = prompt(terminal, "Passphrase", &notice, true)?;
         match store.load(passphrase.as_bytes()) {
             Ok(identity) => return Ok(identity),
             Err(IdentityError::WrongPassphrase) => {
@@ -938,8 +1063,8 @@ fn prompt(
     title: &str,
     notice: &str,
     secret: bool,
-) -> io::Result<String> {
-    let mut input = String::new();
+) -> io::Result<Zeroizing<String>> {
+    let mut input = Zeroizing::new(String::new());
     loop {
         terminal.draw(|frame| draw_prompt(frame, title, notice, &input, secret))?;
         if !event::poll(Duration::from_millis(100))? {
@@ -1056,5 +1181,31 @@ mod tests {
         assert!(description.contains("ada at 192.168.1.20:9000"));
         assert!(description.contains("verified (a1b2)"));
         assert!(description.contains("verify fingerprint"));
+    }
+
+    #[test]
+    fn log_scanning_finds_no_secret_or_plaintext_payload() {
+        let plaintext = "attack at dawn";
+        let secret = "session-secret-abc123";
+        let peer: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        let rendered = [
+            redact_command_input(&format!("/msg ada {plaintext}")),
+            describe_message_event("to", "ada", DeliveryState::Sent),
+            describe_message_event("from", "ada", DeliveryState::Received),
+            describe_control_event(peer, secret.len()),
+            sanitize_display("ada\r\n[VERIFIED]", MAX_SAFE_LABEL),
+        ]
+        .join("\n");
+
+        assert!(!rendered.contains(plaintext));
+        assert!(!rendered.contains(secret));
+        assert!(rendered.contains("[text redacted]"));
+        assert!(rendered.contains('?'));
+    }
+
+    #[test]
+    fn warnings_are_textual_and_acknowledgement_is_parseable() {
+        assert_eq!(ghost_core::command::parse("/ack").unwrap(), Command::Ack);
+        assert!(sanitize_display("ada\r\n[VERIFIED]", MAX_SAFE_LABEL).contains('?'));
     }
 }

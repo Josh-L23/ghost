@@ -22,6 +22,7 @@ pub enum Command {
     RelayStatus,
     RelaySetEnabled(bool),
     Clear,
+    Ack,
     Quit,
 }
 
@@ -95,6 +96,7 @@ pub fn parse(input: &str) -> Result<Command, CommandError> {
         ("history", []) => Ok(Command::History(None)),
         ("history", [conversation]) => Ok(Command::History(Some(conversation.clone()))),
         ("clear", []) => Ok(Command::Clear),
+        ("ack", []) => Ok(Command::Ack),
         ("quit", []) => Ok(Command::Quit),
         ("group", _) => Err(CommandError(
             "Group commands are planned but not implemented yet.".into(),
@@ -185,5 +187,10 @@ mod tests {
             Command::Ping("127.0.0.1:9001".parse().unwrap())
         );
         assert!(parse("/listen nope").is_err());
+    }
+
+    #[test]
+    fn parses_warning_acknowledgement() {
+        assert_eq!(parse("/ack").unwrap(), Command::Ack);
     }
 }
