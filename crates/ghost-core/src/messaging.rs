@@ -172,6 +172,11 @@ pub fn open_frame(
             "sender is not the session peer",
         ));
     }
+    if wire.created_at != decrypted.created_at {
+        return Err(MessagingError::InvalidMessage(
+            "inner timestamp does not match envelope",
+        ));
+    }
 
     let plaintext = session.decrypt_content(
         &wire.nonce,
@@ -255,6 +260,11 @@ pub fn open_receipt_frame(
     }
     if wire.result != RECEIPT_DELIVERED {
         return Err(MessagingError::InvalidMessage("unknown receipt result"));
+    }
+    if wire.created_at != decrypted.created_at {
+        return Err(MessagingError::InvalidMessage(
+            "inner timestamp does not match envelope",
+        ));
     }
     Ok(Receipt {
         message_id: wire.message_id,
@@ -373,6 +383,28 @@ mod tests {
     }
 
     #[test]
+    fn inner_private_timestamp_must_match_the_envelope() {
+        let alice = identity("alice");
+        let bob = identity("bob");
+        let (mut alice_session, mut bob_session) = session_pair(&alice, &bob);
+        let (_, frame) = compose(
+            &mut alice_session,
+            &alice,
+            bob.identity_id(),
+            "timestamp check",
+            now(),
+        )
+        .unwrap();
+        let mut decrypted = bob_session.decrypt(&frame, now()).unwrap();
+        let mut wire: PrivateWireMessage = from_bytes(&decrypted.plaintext).unwrap();
+        wire.created_at += 1;
+        decrypted.plaintext = to_allocvec(&wire).unwrap();
+
+        let error = open_frame(&bob_session, decrypted).unwrap_err();
+        assert!(error.to_string().contains("timestamp"));
+    }
+
+    #[test]
     fn unauthenticated_plaintext_is_never_rendered() {
         let alice = identity("alice");
         let bob = identity("bob");
@@ -404,6 +436,22 @@ mod tests {
         assert_eq!(opened.acknowledged, sent.message_id);
         assert_eq!(opened.sender, bob.identity_id());
         assert_eq!(opened.result, RECEIPT_DELIVERED);
+    }
+
+    #[test]
+    fn inner_receipt_timestamp_must_match_the_envelope() {
+        let alice = identity("alice");
+        let bob = identity("bob");
+        let (mut alice_session, mut bob_session) = session_pair(&alice, &bob);
+        let (_, receipt) =
+            compose_receipt(&mut bob_session, &bob, MessageId([7; 16]), now()).unwrap();
+        let mut decrypted = alice_session.decrypt(&receipt, now()).unwrap();
+        let mut wire: ReceiptWireMessage = from_bytes(&decrypted.plaintext).unwrap();
+        wire.created_at += 1;
+        decrypted.plaintext = to_allocvec(&wire).unwrap();
+
+        let error = open_receipt_frame(&alice_session, decrypted).unwrap_err();
+        assert!(error.to_string().contains("timestamp"));
     }
 
     #[test]

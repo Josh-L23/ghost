@@ -13,6 +13,7 @@ use crossterm::{
 };
 use ghost_core::{
     command::{self, Command},
+    config::{self, Config},
     dedup::ReplayCache,
     delivery::{self, DeliveryState, PendingQueue, TrackedMessage},
     identity::{self, Identity, IdentityError, IdentityStore},
@@ -22,7 +23,8 @@ use ghost_core::{
     trust::{self, TrustRecord, TrustStore},
 };
 use ghost_network::{
-    ConnectionState, TransportCommand, TransportEvent, TransportHandle,
+    ConnectionState, MAX_CONNECTIONS, NetworkLimits, TransportCommand, TransportEvent,
+    TransportHandle,
     discovery::{DiscoveredPeer, DiscoveryEvent, DiscoveryHandle, MAX_DISCOVERED_PEERS},
 };
 use ratatui::{
@@ -36,6 +38,8 @@ use ratatui::{
 use zeroize::Zeroizing;
 
 const RECEIPT_TIMEOUT_SECS: u64 = 60;
+const MAX_TIMELINE_LINES: usize = 500;
+const MAX_CONNECTION_ENTRIES: usize = MAX_CONNECTIONS * 2;
 
 struct App {
     input: String,
@@ -87,14 +91,14 @@ impl App {
             deliveries: PendingQueue::new(),
             dedup: ReplayCache::new(),
         };
-        app.lines.push(format!(
+        app.push_line(format!(
             "Welcome, {username}. Your local identity is ready."
         ));
-        app.lines.push(
+        app.push_line(
             "Unverified peers are never trusted automatically; compare fingerprints out-of-band."
                 .into(),
         );
-        app.lines.push(
+        app.push_line(
             "Local discovery is optional: /scan lists candidates; connect and verify manually."
                 .into(),
         );
@@ -103,14 +107,31 @@ impl App {
         app
     }
 
+    fn push_line(&mut self, line: String) {
+        self.lines.push(line);
+        if self.lines.len() > MAX_TIMELINE_LINES {
+            let excess = self.lines.len() - MAX_TIMELINE_LINES;
+            self.lines.drain(..excess);
+        }
+    }
+
+    fn extend_lines<I>(&mut self, lines: I)
+    where
+        I: IntoIterator<Item = String>,
+    {
+        for line in lines {
+            self.push_line(line);
+        }
+    }
+
     fn handle_input(&mut self) {
         let input = std::mem::take(&mut self.input);
         if input.trim().is_empty() {
             return;
         }
-        self.lines.push(format!("› {input}"));
+        self.push_line(format!("› {input}"));
         match command::parse(&input) {
-            Ok(Command::Help) => self.lines.extend([
+            Ok(Command::Help) => self.extend_lines([
                 "Commands: /help /whoami /peers /verify <peer> <fingerprint>".into(),
                 "          /block <peer> /unblock <peer> /scan /listen <ip:port>".into(),
                 "          /connect <ip:port> /disconnect <ip:port> /ping <ip:port>".into(),
@@ -125,46 +146,49 @@ impl App {
                 "Message history is in-memory only; storage and relay services are not implemented yet.".into(),
             ]),
             Ok(Command::WhoAmI) => {
-                self.lines
-                    .push(format!("Username: {}", self.identity_label));
-                self.lines
-                    .push(format!("Fingerprint: {}", self.fingerprint_short));
-                self.lines
-                    .push(format!("Full:        {}", self.fingerprint_full));
-                self.lines
-                    .push("Compare the fingerprint out-of-band before trusting a peer.".into());
+                self.push_line(format!("Username: {}", self.identity_label));
+                self.push_line(format!("Fingerprint: {}", self.fingerprint_short));
+                self.push_line(format!("Full:        {}", self.fingerprint_full));
+                self.push_line("Compare the fingerprint out-of-band before trusting a peer.".into());
             }
             Ok(Command::Peers) => {
-                self.lines.push(format!(
+                self.push_line(format!(
                     "Listener: {}",
                     self.listen_addr
                         .map(|address| address.to_string())
                         .unwrap_or_else(|| "starting".into())
                 ));
                 if self.connections.is_empty() {
-                    self.lines.push("Connections: none".into());
+                    self.push_line("Connections: none".into());
                 } else {
-                    self.lines.push("Connections:".into());
-                    for (peer, state) in &self.connections {
-                        let session = if self.sessions.contains_key(peer) {
-                            "verified session"
-                        } else if self.handshakes.contains_key(peer) {
-                            "handshaking"
-                        } else {
-                            "no session"
-                        };
-                        self.lines.push(format!("  [{state:?}] {peer} — {session}"));
-                    }
+                    self.push_line("Connections:".into());
+                    let connection_lines: Vec<String> = self
+                        .connections
+                        .iter()
+                        .map(|(peer, state)| {
+                            let session = if self.sessions.contains_key(peer) {
+                                "verified session"
+                            } else if self.handshakes.contains_key(peer) {
+                                "handshaking"
+                            } else {
+                                "no session"
+                            };
+                            format!("  [{state:?}] {peer} — {session}")
+                        })
+                        .collect();
+                    self.extend_lines(connection_lines);
                 }
                 if self.trust.records().is_empty() {
-                    self.lines
-                        .push("No known peers. Connect to a peer to learn its identity.".into());
+                    self.push_line("No known peers. Connect to a peer to learn its identity.".into());
                 } else {
-                    self.lines
-                        .push("Known peers (status is text, not colour-dependent):".into());
-                    for record in self.trust.records() {
-                        self.lines.push(describe_record(record));
-                    }
+                    self.push_line("Known peers (status is text, not colour-dependent):".into());
+                    let trust_lines: Vec<String> = self
+                        .trust
+                        .records()
+                        .iter()
+                        .map(describe_record)
+                        .collect();
+                    self.extend_lines(trust_lines);
                 }
                 let discovered: Vec<String> = self
                     .discovered
@@ -172,61 +196,58 @@ impl App {
                     .map(|peer| describe_discovered(peer, &self.discovered_trust_state(&peer.label)))
                     .collect();
                 if discovered.is_empty() {
-                    self.lines.push(
+                    self.push_line(
                         "Discovered: none. Use /scan; manual /connect still works.".into(),
                     );
                 } else {
-                    self.lines
-                        .push(format!("Discovered candidates ({}):", discovered.len()));
-                    self.lines.extend(discovered);
+                    self.push_line(format!("Discovered candidates ({}):", discovered.len()));
+                    self.extend_lines(discovered);
                 }
             }
             Ok(Command::Verify { peer, fingerprint }) => {
                 match self.trust.verify(&peer, &fingerprint, now()) {
-                    Ok(record) => self.lines.push(format!(
+                    Ok(record) => self.push_line(format!(
                         "[VERIFIED] {} ({}) is trusted for direct sessions.",
                         record.label(),
                         record.short_fingerprint()
                     )),
-                    Err(error) => self.lines.push(format!("Verification failed: {error}")),
+                    Err(error) => self.push_line(format!("Verification failed: {error}")),
                 }
             }
             Ok(Command::Block(peer)) => match self.trust.block(&peer, now()) {
-                Ok(record) => self.lines.push(format!(
+                Ok(record) => self.push_line(format!(
                     "[BLOCKED] {} ({}) will not be trusted.",
                     record.label(),
                     record.short_fingerprint()
                 )),
-                Err(error) => self.lines.push(format!("Block failed: {error}")),
+                Err(error) => self.push_line(format!("Block failed: {error}")),
             },
             Ok(Command::Unblock(peer)) => match self.trust.unblock(&peer, now()) {
-                Ok(record) => self.lines.push(format!(
+                Ok(record) => self.push_line(format!(
                     "[UNVERIFIED] {} ({}) can now be verified.",
                     record.label(),
                     record.short_fingerprint()
                 )),
-                Err(error) => self.lines.push(format!("Unblock failed: {error}")),
+                Err(error) => self.push_line(format!("Unblock failed: {error}")),
             },
             Ok(Command::Scan) => {
                 self.discovery.scan();
-                self.lines
-                    .push("[SCAN] Local discovery requested; results appear below.".into());
+                self.push_line("[SCAN] Local discovery requested; results appear below.".into());
             }
             Ok(Command::Listen(address)) => {
                 self.send_command(TransportCommand::Listen(address));
                 self.discovery.advertise(address.port());
-                self.lines
-                    .push(format!("Requesting listener on {address}."));
+                self.push_line(format!("Requesting listener on {address}."));
             }
             Ok(Command::Connect(address)) => {
                 self.set_connection_state(address, ConnectionState::Connecting);
                 self.send_command(TransportCommand::Connect(address));
-                self.lines.push(format!("Connecting to {address}."));
+                self.push_line(format!("Connecting to {address}."));
             }
             Ok(Command::Disconnect(address)) => {
                 self.send_command(TransportCommand::Disconnect(address));
                 self.set_connection_state(address, ConnectionState::Disconnected);
-                self.lines.push(format!("Closing connection to {address}."));
+                self.push_line(format!("Closing connection to {address}."));
             }
             Ok(Command::Ping(address)) => {
                 let plaintext = format!("PING from {}", self.identity_label);
@@ -241,23 +262,22 @@ impl App {
                             peer: address,
                             frame,
                         });
-                        self.lines
-                            .push(format!("Encrypted probe queued for {address}."));
+                        self.push_line(format!("Encrypted probe queued for {address}."));
                     }
-                    None => self.lines.push(format!(
+                    None => self.push_line(format!(
                         "No established session with {address}. Verify the peer fingerprint first."
                     )),
                 }
             }
             Ok(Command::Message { peer, text }) => {
                 let Some(address) = self.resolve_peer_address(&peer) else {
-                    self.lines.push(format!("No session for peer '{peer}'."));
+                    self.push_line(format!("No session for peer '{peer}'."));
                     return;
                 };
                 let recipient = match self.sessions.get(&address) {
                     Some(session) => session.peer_id(),
                     None => {
-                        self.lines.push(format!("No session for peer '{peer}'."));
+                        self.push_line(format!("No session for peer '{peer}'."));
                         return;
                     }
                 };
@@ -275,7 +295,7 @@ impl App {
                         self.record_message(message, DeliveryState::Queued);
                         if !queued {
                             self.set_message_state(&message_id, DeliveryState::Failed);
-                            self.lines.push(format!(
+                            self.push_line(format!(
                                 "Message failed: {}",
                                 delivery::DeliveryError::QueueFull
                             ));
@@ -292,23 +312,22 @@ impl App {
                         };
                         let _ = self.deliveries.set_state(&message_id, state);
                         self.set_message_state(&message_id, state);
-                        self.lines.push(format!(
+                        self.push_line(format!(
                             "[MSG] to {label}: {text} [{}]",
                             state.label()
                         ));
                     }
-                    Some(Err(error)) => self.lines.push(format!("Message failed: {error}")),
-                    None => self.lines.push(format!("No session for peer '{peer}'.")),
+                    Some(Err(error)) => self.push_line(format!("Message failed: {error}")),
+                    None => self.push_line(format!("No session for peer '{peer}'.")),
                 }
             }
             Ok(Command::Open(peer)) => {
                 let key = self.resolve_conversation_key(&peer);
                 let messages = self.conversations.get(&key).cloned().unwrap_or_default();
                 if messages.is_empty() {
-                    self.lines
-                        .push(format!("No messages yet with '{peer}'."));
+                    self.push_line(format!("No messages yet with '{peer}'."));
                 } else {
-                    self.lines.push(format!("Conversation with '{peer}':"));
+                    self.push_line(format!("Conversation with '{peer}':"));
                     for tracked in messages {
                         let direction = if tracked.message.sender == self.identity.identity_id() {
                             "out"
@@ -316,7 +335,7 @@ impl App {
                             "in"
                         };
                         let label = self.peer_label(&tracked.message.sender);
-                        self.lines.push(format!(
+                        self.push_line(format!(
                             "  [{direction}] {label}: {} [{}]",
                             tracked.message.text,
                             tracked.state.label()
@@ -329,7 +348,7 @@ impl App {
             Ok(_) => self
                 .lines
                 .push("This command is recognized, but its service is not implemented yet.".into()),
-            Err(error) => self.lines.push(format!("Error: {error}")),
+            Err(error) => self.push_line(format!("Error: {error}")),
         }
     }
 
@@ -340,34 +359,34 @@ impl App {
                 TransportEvent::Listening(address) => {
                     self.listen_addr = Some(address);
                     self.discovery.advertise(address.port());
-                    self.lines.push(format!(
+                    self.push_line(format!(
                         "[LISTENING] Accepting manual connections on {address}."
                     ));
-                    self.lines.push(
+                    self.push_line(
                         "[DISCOVERY] Announcing this node on the local network; manual connection remains available."
                             .into(),
                     );
                 }
                 TransportEvent::Incoming(peer) => {
                     self.set_connection_state(peer, ConnectionState::Connected);
-                    self.lines.push(format!("[INCOMING] {peer} connected."));
+                    self.push_line(format!("[INCOMING] {peer} connected."));
                     self.start_handshake(peer);
                 }
                 TransportEvent::Connected(peer) => {
                     self.set_connection_state(peer, ConnectionState::Connected);
-                    self.lines.push(format!("[CONNECTED] {peer}"));
+                    self.push_line(format!("[CONNECTED] {peer}"));
                     self.start_handshake(peer);
                 }
                 TransportEvent::Disconnected(peer, reason) => {
                     self.set_connection_state(peer, ConnectionState::Disconnected);
                     self.handshakes.remove(&peer);
                     self.sessions.remove(&peer);
-                    self.lines.push(format!("[DISCONNECTED] {peer}: {reason}"));
+                    self.push_line(format!("[DISCONNECTED] {peer}: {reason}"));
                 }
                 TransportEvent::Frame { peer, frame } => self.handle_session_frame(peer, frame),
                 TransportEvent::Error { peer, message } => {
                     let peer = peer.map(|peer| peer.to_string()).unwrap_or_default();
-                    self.lines.push(format!("[NETWORK] {peer} {message}"));
+                    self.push_line(format!("[NETWORK] {peer} {message}"));
                 }
             }
         }
@@ -378,7 +397,7 @@ impl App {
             match event {
                 DiscoveryEvent::Found(peer) => {
                     self.insert_discovered(peer.clone());
-                    self.lines.push(format!(
+                    self.push_line(format!(
                         "[DISCOVERY] Found {} at {} (unverified). Use /connect {} and compare fingerprints.",
                         peer.label, peer.addr, peer.addr
                     ));
@@ -389,7 +408,7 @@ impl App {
                 DiscoveryEvent::ScanComplete(peers) => {
                     self.discovered = peers;
                     if self.discovered.is_empty() {
-                        self.lines.push(
+                        self.push_line(
                             "[SCAN] No peers found. mDNS may be blocked; use /connect <ip:port>."
                                 .into(),
                         );
@@ -401,14 +420,14 @@ impl App {
                                 describe_discovered(peer, &self.discovered_trust_state(&peer.label))
                             })
                             .collect();
-                        self.lines.push(format!(
+                        self.push_line(format!(
                             "[SCAN] {} discovered candidate(s):",
                             self.discovered.len()
                         ));
-                        self.lines.extend(descriptions);
+                        self.extend_lines(descriptions);
                     }
                 }
-                DiscoveryEvent::Error(message) => self.lines.push(format!("[DISCOVERY] {message}")),
+                DiscoveryEvent::Error(message) => self.push_line(format!("[DISCOVERY] {message}")),
             }
         }
     }
@@ -443,12 +462,11 @@ impl App {
             Ok((pending, hello)) => {
                 self.send_command(TransportCommand::Send { peer, frame: hello });
                 self.handshakes.insert(peer, pending);
-                self.lines
-                    .push(format!("[SESSION] Authentication started with {peer}."));
+                self.push_line(format!("[SESSION] Authentication started with {peer}."));
             }
-            Err(error) => self
-                .lines
-                .push(format!("[SESSION] Could not start authentication: {error}")),
+            Err(error) => {
+                self.push_line(format!("[SESSION] Could not start authentication: {error}"));
+            }
         }
     }
 
@@ -456,7 +474,7 @@ impl App {
         if let Some(pending) = self.handshakes.remove(&peer) {
             match pending.complete(&self.identity, &mut self.trust, &frame, now()) {
                 Ok(session) => {
-                    self.lines.push(format!(
+                    self.push_line(format!(
                         "[SESSION] Verified {} ({}) with fingerprint {}.",
                         session.peer_label(),
                         session.peer_id(),
@@ -465,8 +483,7 @@ impl App {
                     self.sessions.insert(peer, session);
                 }
                 Err(error) => {
-                    self.lines
-                        .push(format!("[SESSION] Refused {peer}: {error}"));
+                    self.push_line(format!("[SESSION] Refused {peer}: {error}"));
                     self.send_command(TransportCommand::Disconnect(peer));
                 }
             }
@@ -476,7 +493,7 @@ impl App {
         let decrypted = match self.sessions.get_mut(&peer) {
             Some(session) => session.decrypt(&frame, now()),
             None => {
-                self.lines.push(format!(
+                self.push_line(format!(
                     "[SESSION] Unexpected frame from {peer} before authentication."
                 ));
                 return;
@@ -492,8 +509,7 @@ impl App {
             ) {
                 Ok(()) => Ok(frame),
                 Err(error) => {
-                    self.lines
-                        .push(format!("[SESSION] Ignored replayed frame: {error}"));
+                    self.push_line(format!("[SESSION] Ignored replayed frame: {error}"));
                     return;
                 }
             },
@@ -502,7 +518,7 @@ impl App {
         match decrypted {
             Ok(decrypted) if decrypted.message_type == MessageType::CONTROL => {
                 let plaintext = String::from_utf8_lossy(&decrypted.plaintext);
-                self.lines.push(format!("[PING] {peer}: {plaintext}"));
+                self.push_line(format!("[PING] {peer}: {plaintext}"));
             }
             Ok(decrypted) if decrypted.message_type == MessageType::RECEIPT => {
                 let opened = match self.sessions.get(&peer) {
@@ -517,12 +533,12 @@ impl App {
                                 DeliveryState::Acknowledged,
                             );
                             let label = self.peer_label(&tracked.message.recipient);
-                            self.lines.push(format!(
+                            self.push_line(format!(
                                 "[STATE] {label} message acknowledged [{}]",
                                 DeliveryState::Acknowledged.label()
                             ));
                         }
-                        Err(_) => self.lines.push("[STATE] Ignored unknown receipt.".into()),
+                        Err(_) => self.push_line("[STATE] Ignored unknown receipt.".into()),
                     },
                     Err(error) => self
                         .lines
@@ -538,7 +554,7 @@ impl App {
                     Ok(message) => {
                         let label = self.peer_label(&message.sender);
                         let message_id = message.message_id;
-                        self.lines.push(format!("[MSG] {label}: {}", message.text));
+                        self.push_line(format!("[MSG] {label}: {}", message.text));
                         self.record_message(message, DeliveryState::Received);
                         let receipt = self.sessions.get_mut(&peer).map(|session| {
                             messaging::compose_receipt(session, &self.identity, message_id, now())
@@ -548,12 +564,12 @@ impl App {
                                 let _ = self.send_command(TransportCommand::Send { peer, frame });
                             }
                             Some(Err(error)) => {
-                                self.lines.push(format!("[STATE] Receipt failed: {error}"))
+                                self.push_line(format!("[STATE] Receipt failed: {error}"))
                             }
                             None => {}
                         }
                     }
-                    Err(error) => self.lines.push(format!("[MSG] Rejected frame: {error}")),
+                    Err(error) => self.push_line(format!("[MSG] Rejected frame: {error}")),
                 }
             }
             Err(error) => self
@@ -655,7 +671,7 @@ impl App {
         let expired = self.deliveries.expire(now);
         for message_id in expired {
             self.set_message_state(&message_id, DeliveryState::Expired);
-            self.lines.push(format!(
+            self.push_line(format!(
                 "[STATE] Message expired [{}]",
                 DeliveryState::Expired.label()
             ));
@@ -670,6 +686,14 @@ impl App {
         {
             entry.1 = state;
         } else {
+            if self.connections.len() >= MAX_CONNECTION_ENTRIES {
+                let remove = self
+                    .connections
+                    .iter()
+                    .position(|(_, state)| *state == ConnectionState::Disconnected)
+                    .unwrap_or(0);
+                self.connections.remove(remove);
+            }
             self.connections.push((peer, state));
         }
     }
@@ -678,7 +702,7 @@ impl App {
         match self.transport.command(command) {
             Ok(()) => true,
             Err(error) => {
-                self.lines.push(format!("Transport error: {error}"));
+                self.push_line(format!("Transport error: {error}"));
                 false
             }
         }
@@ -738,7 +762,18 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<(), Box<
         .build()?;
     let _guard = runtime.enter();
     let discovery_label = identity.username().to_owned();
-    let transport = ghost_network::start(ghost_network::default_listen_addr())?;
+    let config = Config::load_or_create(config::default_config_path()?)?;
+    let listen = std::env::var("GHOST_LISTEN")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(config.listen_socket_addr()?);
+    let limits = NetworkLimits {
+        max_connections: config.limits.max_connections,
+        max_command_queue: config.limits.max_command_queue,
+        max_event_queue: config.limits.max_event_queue,
+        max_write_queue: config.limits.max_write_queue,
+    };
+    let transport = ghost_network::start_with_limits(listen, limits)?;
     let discovery = ghost_network::discovery::start(discovery_label);
     let mut app = App::new(identity, trust, transport, discovery);
 

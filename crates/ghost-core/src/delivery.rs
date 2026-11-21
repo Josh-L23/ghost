@@ -105,16 +105,18 @@ impl PendingQueue {
     }
 
     pub fn expire(&mut self, now: u64) -> Vec<MessageId> {
-        let expired: Vec<MessageId> = self
-            .entries
-            .iter()
-            .filter(|(_, entry)| {
-                entry.expires_at <= now && entry.state != DeliveryState::Acknowledged
-            })
-            .map(|(id, _)| *id)
-            .collect();
-        for id in &expired {
-            self.entries.remove(id);
+        let mut expired = Vec::new();
+        let mut removable = Vec::new();
+        for (id, entry) in &self.entries {
+            if entry.expires_at <= now && entry.state != DeliveryState::Acknowledged {
+                expired.push(*id);
+                removable.push(*id);
+            } else if entry.state == DeliveryState::Acknowledged {
+                removable.push(*id);
+            }
+        }
+        for id in removable {
+            self.entries.remove(&id);
         }
         expired
     }
@@ -173,5 +175,16 @@ mod tests {
         assert!(queue.acknowledge(&MessageId([9; 16])).is_err());
         queue.acknowledge(&id).unwrap();
         assert_eq!(queue.get(&id).unwrap().state, DeliveryState::Acknowledged);
+    }
+
+    #[test]
+    fn acknowledged_entries_are_pruned_without_being_reported_as_expired() {
+        let mut queue = PendingQueue::new();
+        let acknowledged = message(1);
+        let id = acknowledged.message_id;
+        queue.insert(acknowledged, 100).unwrap();
+        queue.acknowledge(&id).unwrap();
+        assert!(queue.expire(200).is_empty());
+        assert!(queue.is_empty());
     }
 }

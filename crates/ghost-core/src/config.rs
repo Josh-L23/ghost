@@ -8,9 +8,14 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::identity;
+use crate::{identity, protocol::read_bounded};
 
 const MAX_FILE_BYTES: usize = 16 * 1024;
+pub const MAX_CONNECTIONS_CEILING: usize = 8;
+pub const MAX_COMMAND_QUEUE_CEILING: usize = 128;
+pub const MAX_EVENT_QUEUE_CEILING: usize = 128;
+pub const MAX_WRITE_QUEUE_CEILING: usize = 16;
+pub const MAX_HISTORY_MESSAGES_CEILING: usize = 10_000;
 
 #[derive(Debug)]
 pub enum ConfigError {
@@ -107,12 +112,7 @@ impl Config {
     }
 
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
-        let bytes = fs::read(path.as_ref())?;
-        if bytes.len() > MAX_FILE_BYTES {
-            return Err(ConfigError::Invalid(
-                "config file exceeds maximum allowed size".into(),
-            ));
-        }
+        let bytes = read_bounded(path.as_ref(), MAX_FILE_BYTES)?;
         let text = String::from_utf8(bytes)
             .map_err(|_| ConfigError::Parse("file must be valid UTF-8 text".into()))?;
         let config: Config =
@@ -163,15 +163,35 @@ impl Config {
 
 impl Limits {
     pub fn validate(&self) -> Result<(), ConfigError> {
-        check_range("limits.max_connections", self.max_connections, 1, 64)?;
-        check_range("limits.max_command_queue", self.max_command_queue, 1, 1024)?;
-        check_range("limits.max_event_queue", self.max_event_queue, 1, 1024)?;
-        check_range("limits.max_write_queue", self.max_write_queue, 1, 256)?;
+        check_range(
+            "limits.max_connections",
+            self.max_connections,
+            1,
+            MAX_CONNECTIONS_CEILING,
+        )?;
+        check_range(
+            "limits.max_command_queue",
+            self.max_command_queue,
+            1,
+            MAX_COMMAND_QUEUE_CEILING,
+        )?;
+        check_range(
+            "limits.max_event_queue",
+            self.max_event_queue,
+            1,
+            MAX_EVENT_QUEUE_CEILING,
+        )?;
+        check_range(
+            "limits.max_write_queue",
+            self.max_write_queue,
+            1,
+            MAX_WRITE_QUEUE_CEILING,
+        )?;
         check_range(
             "limits.max_history_messages",
             self.max_history_messages,
             0,
-            10_000,
+            MAX_HISTORY_MESSAGES_CEILING,
         )?;
         Ok(())
     }
@@ -302,6 +322,16 @@ relay_enabled = false
             ..Default::default()
         };
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn oversized_config_file_is_rejected_before_parsing() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, vec![b'x'; MAX_FILE_BYTES + 1]).unwrap();
+
+        let error = Config::load(&path).unwrap_err();
+        assert!(error.to_string().contains("maximum allowed size"));
     }
 
     #[test]
