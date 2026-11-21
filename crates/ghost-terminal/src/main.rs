@@ -17,10 +17,15 @@ use ghost_core::{
     config::{self, Config},
     dedup::ReplayCache,
     delivery::{self, DeliveryState, PendingQueue, TrackedMessage},
+    group::{
+        self, GroupDirective, GroupMemberInfo, GroupMessage, GroupRequestContext, GroupService,
+        GroupSummary, GroupUpdate,
+    },
     identity::{self, Identity, IdentityError, IdentityStore},
     messaging::{self, PrivateMessage},
-    protocol::{IdentityId, MessageType},
+    protocol::{GroupId, GroupName, IdentityId, MessageType},
     session::{self, EstablishedSession, PendingSession},
+    storage::{self, Storage},
     trust::{self, TrustRecord, TrustStore},
 };
 use ghost_network::{
@@ -62,6 +67,8 @@ struct App {
     fingerprint_full: String,
     trust: TrustStore,
     identity: Identity,
+    storage: Storage,
+    groups: GroupService,
     transport: TransportHandle,
     discovery: DiscoveryHandle,
     discovered: Vec<DiscoveredPeer>,
@@ -72,6 +79,7 @@ struct App {
     handshakes: HashMap<SocketAddr, PendingSession>,
     sessions: HashMap<SocketAddr, EstablishedSession>,
     conversations: HashMap<String, Vec<TrackedMessage>>,
+    group_messages: HashMap<String, Vec<GroupMessage>>,
     deliveries: PendingQueue,
     dedup: ReplayCache,
 }
@@ -80,6 +88,8 @@ impl App {
     fn new(
         identity: Identity,
         trust: TrustStore,
+        storage: Storage,
+        groups: GroupService,
         transport: TransportHandle,
         discovery: DiscoveryHandle,
     ) -> Self {
@@ -95,6 +105,8 @@ impl App {
             fingerprint_full: fingerprint.full(),
             trust,
             identity,
+            storage,
+            groups,
             transport,
             discovery,
             discovered: Vec::new(),
@@ -105,6 +117,7 @@ impl App {
             handshakes: HashMap::new(),
             sessions: HashMap::new(),
             conversations: HashMap::new(),
+            group_messages: HashMap::new(),
             deliveries: PendingQueue::new(),
             dedup: ReplayCache::new(),
         };
@@ -251,6 +264,7 @@ impl App {
                 "          /block <peer> /unblock <peer> /scan /listen <ip:port>".into(),
                 "          /connect <ip:port> /disconnect <ip:port> /ping <ip:port>".into(),
                 "          /msg <peer> <text> /open <peer> /history [peer|group]".into(),
+                "          /group create|list|members|invite|send|remove".into(),
                 "          /relay status|enable|disable /clear /ack /quit".into(),
                 "/whoami shows your username and identity fingerprint.".into(),
                 "Peers may be selected by label, short fingerprint, or full fingerprint.".into(),
@@ -260,7 +274,7 @@ impl App {
                 "Discovered peers are never trusted or contacted without your approval.".into(),
                 "Delivery indicators are text; a transport write is not a receipt.".into(),
                 "Security warnings stay visible until /ack; message text is never echoed in activity logs.".into(),
-                "Message history is in-memory only; storage and relay services are not implemented yet.".into(),
+                "Direct-message history is in-memory only; group state is stored locally via MLS.".into(),
             ]),
             Ok(Command::WhoAmI) => {
                 self.push_line(format!("Username: {}", self.identity_label));
@@ -440,6 +454,10 @@ impl App {
                 }
             }
             Ok(Command::Open(peer)) => {
+                if let Ok(group_id) = self.resolve_group_id(&peer) {
+                    self.render_group_history(&group_id);
+                    return;
+                }
                 let key = self.resolve_conversation_key(&peer);
                 let messages = self.conversations.get(&key).cloned().unwrap_or_default();
                 if messages.is_empty() {
@@ -459,6 +477,105 @@ impl App {
                             tracked.state.label()
                         ));
                     }
+                }
+            }
+            Ok(Command::GroupCreate(name)) => {
+                match self
+                    .groups
+                    .create_group(&self.identity, &mut self.storage, &name, now())
+                {
+                    Ok(result) => {
+                        self.report_group_update(result.update);
+                        self.dispatch_group_directives(result.directives);
+                    }
+                    Err(error) => self.push_line(format!("Group create failed: {error}")),
+                }
+            }
+            Ok(Command::GroupList) => match self.groups.list_groups(&self.storage) {
+                Ok(groups) => self.render_group_list(&groups),
+                Err(error) => self.push_line(format!("Group list failed: {error}")),
+            },
+            Ok(Command::GroupMembers(group)) => {
+                let group_id = match self.resolve_group_id(&group) {
+                    Ok(id) => id,
+                    Err(error) => {
+                        self.push_line(format!("Group lookup failed: {error}"));
+                        return;
+                    }
+                };
+                match self.groups.list_members(&self.storage, &group_id) {
+                    Ok(members) => self.render_group_members(&group_id, &members),
+                    Err(error) => self.push_line(format!("Group members failed: {error}")),
+                }
+            }
+            Ok(Command::GroupInvite { group, peer }) => {
+                let group_id = match self.resolve_group_id(&group) {
+                    Ok(id) => id,
+                    Err(error) => {
+                        self.push_line(format!("Group lookup failed: {error}"));
+                        return;
+                    }
+                };
+                let Some(peer_id) = self.resolve_peer_identity(&peer) else {
+                    self.push_line(format!("No verified peer '{peer}'."));
+                    return;
+                };
+                match self.groups.invite(
+                    &self.identity,
+                    &mut self.storage,
+                    &group_id,
+                    peer_id,
+                ) {
+                    Ok(result) => {
+                        self.report_group_update(result.update);
+                        self.dispatch_group_directives(result.directives);
+                    }
+                    Err(error) => self.push_line(format!("Group invite failed: {error}")),
+                }
+            }
+            Ok(Command::GroupSend { group, text }) => {
+                let group_id = match self.resolve_group_id(&group) {
+                    Ok(id) => id,
+                    Err(error) => {
+                        self.push_line(format!("Group lookup failed: {error}"));
+                        return;
+                    }
+                };
+                match self
+                    .groups
+                    .send_application(&self.identity, &group_id, &text, now())
+                {
+                    Ok(result) => {
+                        self.report_group_update(result.update);
+                        self.dispatch_group_directives(result.directives);
+                    }
+                    Err(error) => self.push_line(format!("Group send failed: {error}")),
+                }
+            }
+            Ok(Command::GroupRemove { group, peer }) => {
+                let group_id = match self.resolve_group_id(&group) {
+                    Ok(id) => id,
+                    Err(error) => {
+                        self.push_line(format!("Group lookup failed: {error}"));
+                        return;
+                    }
+                };
+                let Some(peer_id) = self.resolve_peer_identity(&peer) else {
+                    self.push_line(format!("No verified peer '{peer}'."));
+                    return;
+                };
+                match self.groups.remove_member(
+                    &self.identity,
+                    &mut self.storage,
+                    &group_id,
+                    peer_id,
+                    now(),
+                ) {
+                    Ok(result) => {
+                        self.report_group_update(result.update);
+                        self.dispatch_group_directives(result.directives);
+                    }
+                    Err(error) => self.push_line(format!("Group remove failed: {error}")),
                 }
             }
             Ok(Command::Clear) => self.lines.clear(),
@@ -637,6 +754,29 @@ impl App {
             Err(error) => Err(error),
         };
         match decrypted {
+            Ok(decrypted) if decrypted.message_type == MessageType::GROUP_CONTROL => {
+                let Some(group_id) = decrypted.group_id else {
+                    self.warn("Rejected group frame without a group recipient.".into());
+                    return;
+                };
+                match self.groups.handle_wire(
+                    &self.identity,
+                    &mut self.storage,
+                    &self.trust,
+                    GroupRequestContext {
+                        sender: decrypted.sender,
+                        now: now(),
+                    },
+                    &group_id,
+                    &decrypted.plaintext,
+                ) {
+                    Ok(result) => {
+                        self.report_group_update(result.update);
+                        self.dispatch_group_directives(result.directives);
+                    }
+                    Err(error) => self.warn(format!("Rejected group frame: {error}")),
+                }
+            }
             Ok(decrypted) if decrypted.message_type == MessageType::CONTROL => {
                 self.push_line(describe_control_event(peer, decrypted.plaintext.len()));
             }
@@ -712,10 +852,10 @@ impl App {
     }
 
     fn resolve_conversation_key(&self, selector: &str) -> String {
-        if let Some(address) = self.resolve_peer_address(selector) {
-            if let Some(session) = self.sessions.get(&address) {
-                return session.peer_id().to_string();
-            }
+        if let Some(address) = self.resolve_peer_address(selector)
+            && let Some(session) = self.sessions.get(&address)
+        {
+            return session.peer_id().to_string();
         }
         if let Some(record) = self.trust.records().iter().find(|record| {
             let full = identity::fingerprint_from_public_key(&record.identity_id.0).full();
@@ -821,6 +961,177 @@ impl App {
         }
     }
 
+    fn resolve_group_id(&self, selector: &str) -> Result<GroupId, String> {
+        self.groups
+            .resolve_group(&self.storage, selector)
+            .map_err(|error| error.to_string())
+    }
+
+    fn resolve_peer_identity(&self, selector: &str) -> Option<IdentityId> {
+        if let Some(address) = self.resolve_peer_address(selector)
+            && let Some(session) = self.sessions.get(&address)
+        {
+            return Some(session.peer_id());
+        }
+        self.trust
+            .records()
+            .iter()
+            .find(|record| {
+                record.state == trust::TrustState::Verified
+                    && (record.label() == selector
+                        || record.short_fingerprint() == selector
+                        || record.full_fingerprint() == selector
+                        || record.identity_id.to_string() == selector)
+            })
+            .map(|record| record.identity_id)
+    }
+
+    fn resolve_address_for_identity(&self, identity_id: &IdentityId) -> Option<SocketAddr> {
+        self.sessions
+            .iter()
+            .find_map(|(address, session)| (session.peer_id() == *identity_id).then_some(*address))
+    }
+
+    fn dispatch_group_directives(&mut self, directives: Vec<GroupDirective>) {
+        for directive in directives {
+            let Some(address) = self.resolve_address_for_identity(&directive.recipient) else {
+                self.warn(format!(
+                    "No verified session for group member {}.",
+                    directive.recipient
+                ));
+                continue;
+            };
+            let frame = self.sessions.get_mut(&address).and_then(|session| {
+                session
+                    .encrypt_group_control(
+                        &self.identity,
+                        directive.group_id,
+                        &directive.payload,
+                        now(),
+                    )
+                    .ok()
+            });
+            match frame {
+                Some(frame) => {
+                    self.send_command(TransportCommand::Send {
+                        peer: address,
+                        frame,
+                    });
+                    self.push_line(format!(
+                        "[GROUP] control sent to {}.",
+                        self.peer_label(&directive.recipient)
+                    ));
+                }
+                None => self.warn(format!(
+                    "Group control could not be encrypted for {}.",
+                    directive.recipient
+                )),
+            }
+        }
+    }
+
+    fn report_group_update(&mut self, update: GroupUpdate) {
+        match update {
+            GroupUpdate::Created { group_id, name } => self.push_line(format!(
+                "[GROUP] Created '{}' ({group_id}).",
+                display_group_name(&name)
+            )),
+            GroupUpdate::InviteSent { group_id, peer } => self.push_line(format!(
+                "[GROUP] Invitation for {group_id} sent to {}.",
+                self.peer_label(&peer)
+            )),
+            GroupUpdate::KeyPackageSent { group_id } => {
+                self.push_line(format!("[GROUP] Key package sent for {group_id}."));
+            }
+            GroupUpdate::Joined { group_id, name } => self.push_line(format!(
+                "[GROUP] Joined '{}' ({group_id}).",
+                display_group_name(&name)
+            )),
+            GroupUpdate::CommitApplied { group_id } => {
+                self.push_line(format!("[GROUP] Membership update applied to {group_id}."));
+            }
+            GroupUpdate::Message { message } => {
+                let label = self.peer_label(&message.sender);
+                self.push_line(format!(
+                    "[GROUP] from {label} in {}: [text redacted] [epoch {}]",
+                    message.group_id, message.epoch
+                ));
+                self.record_group_message(message);
+            }
+        }
+    }
+
+    fn record_group_message(&mut self, message: GroupMessage) {
+        let key = message.group_id.to_string();
+        let history = self.group_messages.entry(key).or_default();
+        let duplicate = history.iter().any(|item| {
+            item.sender == message.sender
+                && item.created_at == message.created_at
+                && item.text == message.text
+        });
+        if !duplicate {
+            history.push(message);
+        }
+        if history.len() > 200 {
+            history.remove(0);
+        }
+    }
+
+    fn render_group_history(&mut self, group_id: &GroupId) {
+        let messages = self
+            .group_messages
+            .get(&group_id.to_string())
+            .cloned()
+            .unwrap_or_default();
+        if messages.is_empty() {
+            self.push_line(format!("No group messages yet for '{group_id}'."));
+            return;
+        }
+        self.push_line(format!("Group conversation {group_id}:"));
+        for message in messages {
+            let direction = if message.sender == self.identity.identity_id() {
+                "out"
+            } else {
+                "in"
+            };
+            let label = self.peer_label(&message.sender);
+            self.push_line(format!(
+                "  [{direction}] {label}: {} [epoch {}]",
+                sanitize_display(&message.text, MAX_SAFE_TEXT),
+                message.epoch
+            ));
+        }
+    }
+
+    fn render_group_list(&mut self, groups: &[GroupSummary]) {
+        if groups.is_empty() {
+            self.push_line("No groups yet. Use /group create <name>.".into());
+            return;
+        }
+        self.push_line(format!("Groups ({}):", groups.len()));
+        for group in groups {
+            self.push_line(format!(
+                "  {} — id={} members={} epoch={}",
+                display_group_name(&group.name),
+                group.group_id,
+                group.member_count,
+                group.epoch
+            ));
+        }
+    }
+
+    fn render_group_members(&mut self, group_id: &GroupId, members: &[GroupMemberInfo]) {
+        self.push_line(format!("Members of {group_id}:"));
+        for member in members {
+            self.push_line(format!(
+                "  {} {} — {}",
+                member.role,
+                self.peer_label(&member.identity_id),
+                member.identity_id
+            ));
+        }
+    }
+
     fn send_command(&mut self, command: TransportCommand) -> bool {
         match self.transport.command(command) {
             Ok(()) => true,
@@ -872,7 +1183,8 @@ fn sanitize_display(input: &str, max: usize) -> String {
 
 fn redact_command_input(input: &str) -> String {
     let trimmed = input.trim();
-    if trimmed.to_ascii_lowercase().starts_with("/msg") {
+    let lowercase = trimmed.to_ascii_lowercase();
+    if lowercase.starts_with("/msg") {
         let peer = trimmed
             .get(4..)
             .unwrap_or_default()
@@ -884,7 +1196,26 @@ fn redact_command_input(input: &str) -> String {
             sanitize_display(peer, MAX_SAFE_LABEL)
         );
     }
+    if lowercase.starts_with("/group send") {
+        let group = trimmed
+            .get(11..)
+            .unwrap_or_default()
+            .split_whitespace()
+            .next()
+            .unwrap_or_default();
+        return format!(
+            "› /group send {} [text redacted]",
+            sanitize_display(group, MAX_SAFE_LABEL)
+        );
+    }
     format!("› {}", sanitize_display(trimmed, MAX_SAFE_TEXT))
+}
+
+fn display_group_name(name: &GroupName) -> String {
+    sanitize_display(
+        String::from_utf8_lossy(name.as_slice()).as_ref(),
+        MAX_SAFE_LABEL,
+    )
 }
 
 fn describe_message_event(direction: &str, label: &str, state: DeliveryState) -> String {
@@ -930,10 +1261,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     match result {
         Ok(()) => Ok(()),
         Err(error) => {
-            if let Some(io_error) = error.downcast_ref::<io::Error>() {
-                if io_error.kind() == io::ErrorKind::Interrupted {
-                    return Ok(());
-                }
+            if let Some(io_error) = error.downcast_ref::<io::Error>()
+                && io_error.kind() == io::ErrorKind::Interrupted
+            {
+                return Ok(());
             }
             Err(error)
         }
@@ -943,6 +1274,9 @@ fn main() -> Result<(), Box<dyn Error>> {
 fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<(), Box<dyn Error>> {
     let identity = setup_identity(terminal)?;
     let (trust, trust_recovery) = TrustStore::load_or_safe_empty(trust::default_trust_path()?)?;
+    let (storage, storage_recovery) =
+        Storage::open_or_quarantined(storage::default_storage_path()?)?;
+    let groups = GroupService::open(&identity, group::default_mls_storage_path()?)?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
@@ -961,7 +1295,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<(), Box<
     };
     let transport = ghost_network::start_with_limits(listen, limits)?;
     let discovery = ghost_network::discovery::start(discovery_label);
-    let mut app = App::new(identity, trust, transport, discovery);
+    let mut app = App::new(identity, trust, storage, groups, transport, discovery);
     if let Some(path) = config_recovery {
         app.warn(format!(
             "Config was unreadable; defaults loaded and the old file moved to {}.",
@@ -974,30 +1308,34 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<(), Box<
             path.display()
         ));
     }
+    if let Some(path) = storage_recovery {
+        app.warn(format!(
+            "Local storage was unreadable; starting with a fresh database and the old file moved to {}.",
+            path.display()
+        ));
+    }
 
     while !app.should_quit {
         app.process_reconnects();
         app.drain_events();
         app.expire_pending(now());
         terminal.draw(|frame| draw(frame, &app))?;
-        if event::poll(Duration::from_millis(100))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind != KeyEventKind::Press {
-                    continue;
+        if event::poll(Duration::from_millis(100))?
+            && let Event::Key(key) = event::read()?
+        {
+            if key.kind != KeyEventKind::Press {
+                continue;
+            }
+            match (key.code, key.modifiers) {
+                (KeyCode::Char('c'), KeyModifiers::CONTROL) | (KeyCode::Esc, _) => {
+                    app.should_quit = true
                 }
-                match (key.code, key.modifiers) {
-                    (KeyCode::Char('c'), KeyModifiers::CONTROL) | (KeyCode::Esc, _) => {
-                        app.should_quit = true
-                    }
-                    (KeyCode::Enter, _) => app.handle_input(),
-                    (KeyCode::Backspace, _) => {
-                        app.input.pop();
-                    }
-                    (KeyCode::Char(ch), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
-                        app.input.push(ch)
-                    }
-                    _ => {}
+                (KeyCode::Enter, _) => app.handle_input(),
+                (KeyCode::Backspace, _) => {
+                    app.input.pop();
                 }
+                (KeyCode::Char(ch), KeyModifiers::NONE | KeyModifiers::SHIFT) => app.input.push(ch),
+                _ => {}
             }
         }
     }

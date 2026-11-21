@@ -779,10 +779,10 @@ mod tests {
         alice.shutdown();
         let event = timeout(Duration::from_secs(2), async {
             loop {
-                if let Some(event) = bob.try_event() {
-                    if matches!(event, TransportEvent::Disconnected(_, _)) {
-                        return event;
-                    }
+                if let Some(event) = bob.try_event()
+                    && matches!(event, TransportEvent::Disconnected(_, _))
+                {
+                    return event;
                 }
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }

@@ -16,8 +16,9 @@ use zeroize::Zeroizing;
 use crate::{
     identity::Identity,
     protocol::{
-        BoundedBytes, Envelope, IdentityId, MAX_ENCRYPTED_PAYLOAD_BYTES, MessageId, MessageType,
-        PROTOCOL_VERSION, ProtocolError, Recipient, RoutingMetadata, decode_frame, encode_frame,
+        BoundedBytes, Envelope, GroupId, IdentityId, MAX_ENCRYPTED_PAYLOAD_BYTES, MessageId,
+        MessageType, PROTOCOL_VERSION, ProtocolError, Recipient, RoutingMetadata, decode_frame,
+        encode_frame,
     },
     trust::{TrustError, TrustState, TrustStore},
 };
@@ -98,6 +99,7 @@ pub struct DecryptedFrame {
     pub message_id: MessageId,
     pub sender: IdentityId,
     pub recipient: IdentityId,
+    pub group_id: Option<GroupId>,
     pub created_at: u64,
     pub message_type: MessageType,
     pub plaintext: Vec<u8>,
@@ -263,13 +265,46 @@ impl EstablishedSession {
         now: u64,
         message_type: MessageType,
     ) -> Result<Vec<u8>, SessionError> {
+        self.encrypt_envelope(
+            identity,
+            plaintext,
+            now,
+            Recipient::Peer(self.peer_id),
+            message_type,
+        )
+    }
+
+    pub fn encrypt_group_control(
+        &mut self,
+        identity: &Identity,
+        group_id: GroupId,
+        plaintext: &[u8],
+        now: u64,
+    ) -> Result<Vec<u8>, SessionError> {
+        self.encrypt_envelope(
+            identity,
+            plaintext,
+            now,
+            Recipient::Group(group_id),
+            MessageType::GROUP_CONTROL,
+        )
+    }
+
+    fn encrypt_envelope(
+        &mut self,
+        identity: &Identity,
+        plaintext: &[u8],
+        now: u64,
+        recipient: Recipient,
+        message_type: MessageType,
+    ) -> Result<Vec<u8>, SessionError> {
         if plaintext.is_empty() || plaintext.len() > MAX_SESSION_PLAINTEXT {
             return Err(SessionError::PayloadTooLarge);
         }
 
         let mut nonce = [0u8; NONCE_LEN];
         OsRng.fill_bytes(&mut nonce);
-        let aad = self.aad(self.send_sequence, self.local_id, self.peer_id);
+        let aad = self.aad(self.send_sequence, self.local_id, &recipient, message_type);
         let cipher = ChaCha20Poly1305::new_from_slice(&self.key[..])
             .map_err(|_| SessionError::KeyDerivation)?;
         let ciphertext = cipher
@@ -291,7 +326,7 @@ impl EstablishedSession {
             protocol_version: PROTOCOL_VERSION,
             message_id: MessageId(message_id),
             sender_identity: self.local_id,
-            recipient: Recipient::Peer(self.peer_id),
+            recipient,
             message_type,
             created_at: now,
             expires_at: now.saturating_add(60),
@@ -308,13 +343,21 @@ impl EstablishedSession {
 
     pub fn decrypt(&mut self, frame: &[u8], now: u64) -> Result<DecryptedFrame, SessionError> {
         let envelope = decode_frame(frame, now)?;
-        if envelope.sender_identity != self.peer_id
-            || envelope.recipient != Recipient::Peer(self.local_id)
-        {
+        if envelope.sender_identity != self.peer_id {
             return Err(SessionError::BadRecipient);
         }
+        let group_id = match envelope.recipient {
+            Recipient::Peer(id) if id == self.local_id => None,
+            Recipient::Group(id) => Some(id),
+            _ => return Err(SessionError::BadRecipient),
+        };
 
-        let aad = self.aad(self.recv_sequence, envelope.sender_identity, self.local_id);
+        let aad = self.aad(
+            self.recv_sequence,
+            envelope.sender_identity,
+            &envelope.recipient,
+            envelope.message_type,
+        );
         let peer_key =
             VerifyingKey::from_bytes(&self.peer_id.0).map_err(|_| SessionError::BadSignature)?;
         peer_key
@@ -343,10 +386,8 @@ impl EstablishedSession {
         Ok(DecryptedFrame {
             message_id: envelope.message_id,
             sender: envelope.sender_identity,
-            recipient: match envelope.recipient {
-                Recipient::Peer(id) => id,
-                Recipient::Group(_) => return Err(SessionError::BadRecipient),
-            },
+            recipient: self.local_id,
+            group_id,
             created_at: envelope.created_at,
             message_type: envelope.message_type,
             plaintext,
@@ -437,13 +478,29 @@ impl EstablishedSession {
         aad
     }
 
-    fn aad(&self, sequence: u64, sender: IdentityId, recipient: IdentityId) -> Vec<u8> {
-        let mut aad = Vec::with_capacity(16 + 32 + 32 + 32 + 8 + 32);
+    fn aad(
+        &self,
+        sequence: u64,
+        sender: IdentityId,
+        recipient: &Recipient,
+        message_type: MessageType,
+    ) -> Vec<u8> {
+        let mut aad = Vec::with_capacity(16 + 32 + 32 + 33 + 8 + 1);
         aad.extend_from_slice(&self.session_id);
         aad.extend_from_slice(&self.transcript);
         aad.extend_from_slice(&sender.0);
-        aad.extend_from_slice(&recipient.0);
+        match recipient {
+            Recipient::Peer(id) => {
+                aad.push(0);
+                aad.extend_from_slice(&id.0);
+            }
+            Recipient::Group(id) => {
+                aad.push(1);
+                aad.extend_from_slice(&id.0);
+            }
+        }
         aad.extend_from_slice(&sequence.to_be_bytes());
+        aad.push(message_type.0);
         aad
     }
 }
@@ -645,7 +702,7 @@ mod tests {
         let alice = identity("alice");
         let bob = identity("bob");
         let (alice_pending, _) = initiate(&alice).unwrap();
-        let (_, bad_hello) = initiate_with_version(&bob, 2).unwrap();
+        let (_, bad_hello) = initiate_with_version(&bob, 3).unwrap();
         let mut trust = trust_for(&bob);
 
         assert!(

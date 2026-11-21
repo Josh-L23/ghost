@@ -319,13 +319,13 @@ impl TrustStore {
                     return Some(index);
                 }
             }
-            if bytes.len() == 8 {
-                if let Some(index) = self.records.iter().position(|record| {
+            if bytes.len() == 8
+                && let Some(index) = self.records.iter().position(|record| {
                     let fingerprint = fingerprint_from_public_key(&record.identity_id.0);
                     fingerprint.as_bytes()[..8] == bytes[..]
-                }) {
-                    return Some(index);
-                }
+                })
+            {
+                return Some(index);
             }
         }
         self.index_of_label(selector)
@@ -351,7 +351,7 @@ pub fn default_trust_path() -> Result<PathBuf, TrustError> {
 }
 
 fn decode_hex(input: &str) -> Option<Vec<u8>> {
-    if input.len() % 2 != 0 {
+    if !input.len().is_multiple_of(2) {
         return None;
     }
     (0..input.len())
