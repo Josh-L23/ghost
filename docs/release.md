@@ -172,7 +172,7 @@ This is therefore a documented development milestone, not a complete implementat
 
 ## Known risks and open decisions
 
-- Group key management requires a reviewed protocol such as MLS before group messaging is implemented.
+- Group key management requires a reviewed protocol before group messaging is implemented. The design decision is recorded in [group-security.md](group-security.md).
 - Relay scope, expiry, revocation propagation, and forwarding limits need explicit design before enabling forwarding.
 - Store-and-forward retains encrypted envelopes and privacy obligations; it is out of scope and offline delivery fails.
 - Bluetooth needs platform adapters, permissions, and BLE/Classic decisions; it is not supported yet.
